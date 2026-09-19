@@ -63,6 +63,18 @@ def receive_sensor_data(data: SensorData):
     return run_pipeline(data, deliver=True)
 
 
+@app.post("/sensor-data-preview")
+def preview_sensor_data(data: SensorData):
+    """
+    Same as /sensor-data but NEVER places a call or sends an SMS.
+    Use this to test as many custom sensor value combinations as you want
+    (dry soil, wet soil, different days_since_sowing, etc.) without using up
+    any of your limited Twilio SMS/call quota. Only switch to the real
+    /sensor-data endpoint once you're confident the logic is correct.
+    """
+    return run_pipeline(data, deliver=False)
+
+
 @app.get("/test-advisory")
 def test_advisory():
     """
