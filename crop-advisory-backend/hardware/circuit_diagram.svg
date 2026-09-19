@@ -1,0 +1,102 @@
+<svg viewBox="0 0 1100 760" xmlns="http://www.w3.org/2000/svg" font-family="Helvetica, Arial, sans-serif">
+  <rect x="0" y="0" width="1100" height="760" fill="#ffffff"/>
+  <text x="550" y="32" text-anchor="middle" font-size="20" font-weight="bold" fill="#1a3c34">
+    Wiring Diagram — ESP32 DevKit to Sensors
+  </text>
+  <text x="550" y="52" text-anchor="middle" font-size="11.5" fill="#666">
+    Red = 3.3V power   Black = GND   Blue = signal/data   Green = I2C (SDA/SCL)
+  </text>
+
+  <!-- ESP32 board -->
+  <rect x="420" y="260" width="260" height="340" rx="12" fill="#2b2b2b" stroke="#000" stroke-width="2"/>
+  <text x="550" y="290" text-anchor="middle" font-size="14" font-weight="bold" fill="#ffffff">ESP32 DevKit</text>
+  <rect x="480" y="300" width="140" height="60" fill="#444" stroke="#888"/>
+  <text x="550" y="335" text-anchor="middle" font-size="10" fill="#ccc">USB / Antenna</text>
+
+  <!-- Left pin labels (power) -->
+  <text x="410" y="392" text-anchor="end" font-size="11" fill="#ffffff" transform="translate(0,0)"></text>
+  <!-- Pin markers on ESP32 - left side -->
+  <circle cx="420" cy="400" r="4" fill="#e74c3c"/>
+  <text x="405" y="404" text-anchor="end" font-size="11" fill="#1a3c34">3V3</text>
+  <circle cx="420" cy="430" r="4" fill="#222"/>
+  <text x="405" y="434" text-anchor="end" font-size="11" fill="#1a3c34">GND</text>
+  <circle cx="420" cy="460" r="4" fill="#2980ff"/>
+  <text x="405" y="464" text-anchor="end" font-size="11" fill="#1a3c34">GPIO4</text>
+  <circle cx="420" cy="490" r="4" fill="#2980ff"/>
+  <text x="405" y="494" text-anchor="end" font-size="11" fill="#1a3c34">GPIO34 (ADC)</text>
+  <circle cx="420" cy="520" r="4" fill="#2980ff"/>
+  <text x="405" y="524" text-anchor="end" font-size="11" fill="#1a3c34">GPIO35 (ADC)</text>
+  <circle cx="420" cy="550" r="4" fill="#2ecc71"/>
+  <text x="405" y="554" text-anchor="end" font-size="11" fill="#1a3c34">GPIO21 (SDA)</text>
+  <circle cx="420" cy="580" r="4" fill="#2ecc71"/>
+  <text x="405" y="584" text-anchor="end" font-size="11" fill="#1a3c34">GPIO22 (SCL)</text>
+
+  <!-- DHT22 module -->
+  <rect x="60" y="120" width="180" height="90" rx="8" fill="#eef5f3" stroke="#1a3c34" stroke-width="1.5"/>
+  <text x="150" y="145" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1a3c34">DHT22</text>
+  <text x="150" y="163" text-anchor="middle" font-size="10" fill="#333">Temp / Humidity</text>
+  <text x="150" y="180" text-anchor="middle" font-size="9.5" fill="#555">VCC · GND · DATA</text>
+  <text x="150" y="196" text-anchor="middle" font-size="9" fill="#888">(add 10k pull-up: DATA to VCC)</text>
+
+  <!-- Capacitive soil moisture -->
+  <rect x="60" y="330" width="180" height="90" rx="8" fill="#eef5f3" stroke="#1a3c34" stroke-width="1.5"/>
+  <text x="150" y="355" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1a3c34">Capacitive Soil</text>
+  <text x="150" y="372" text-anchor="middle" font-size="10" fill="#333">Moisture Sensor v1.2</text>
+  <text x="150" y="390" text-anchor="middle" font-size="9.5" fill="#555">VCC · GND · AOUT</text>
+
+  <!-- FC-37 rain sensor -->
+  <rect x="60" y="440" width="180" height="90" rx="8" fill="#eef5f3" stroke="#1a3c34" stroke-width="1.5"/>
+  <text x="150" y="465" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1a3c34">FC-37 Rain Sensor</text>
+  <text x="150" y="483" text-anchor="middle" font-size="10" fill="#333">(with LM393 comparator)</text>
+  <text x="150" y="500" text-anchor="middle" font-size="9.5" fill="#555">VCC · GND · AOUT</text>
+
+  <!-- BH1750 -->
+  <rect x="60" y="550" width="180" height="90" rx="8" fill="#eef5f3" stroke="#1a3c34" stroke-width="1.5"/>
+  <text x="150" y="575" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#1a3c34">BH1750</text>
+  <text x="150" y="592" text-anchor="middle" font-size="10" fill="#333">Light Sensor (optional)</text>
+  <text x="150" y="610" text-anchor="middle" font-size="9.5" fill="#555">VCC · GND · SDA · SCL</text>
+
+  <!-- Power source -->
+  <rect x="850" y="350" width="180" height="110" rx="8" fill="#fdf3ea" stroke="#c98a3e" stroke-width="1.5"/>
+  <text x="940" y="375" text-anchor="middle" font-size="12.5" font-weight="bold" fill="#7a4a10">Power Source</text>
+  <text x="940" y="395" text-anchor="middle" font-size="10" fill="#7a4a10">Demo: USB 5V (laptop/adapter)</text>
+  <text x="940" y="413" text-anchor="middle" font-size="10" fill="#7a4a10">Field: 6V solar panel +</text>
+  <text x="940" y="429" text-anchor="middle" font-size="10" fill="#7a4a10">TP4056 + 18650 battery</text>
+  <text x="940" y="448" text-anchor="middle" font-size="9.5" fill="#a06424">(connects to ESP32 5V/VIN pin)</text>
+
+  <!-- Wires: DHT22 -->
+  <path d="M240,150 L420,400" fill="none" stroke="#e74c3c" stroke-width="1.5"/>
+  <path d="M240,165 L420,430" fill="none" stroke="#222" stroke-width="1.5"/>
+  <path d="M240,180 L420,460" fill="none" stroke="#2980ff" stroke-width="1.8"/>
+
+  <!-- Wires: Soil moisture -->
+  <path d="M240,352 L420,400" fill="none" stroke="#e74c3c" stroke-width="1.5"/>
+  <path d="M240,368 L420,430" fill="none" stroke="#222" stroke-width="1.5"/>
+  <path d="M240,384 L420,490" fill="none" stroke="#2980ff" stroke-width="1.8"/>
+
+  <!-- Wires: Rain sensor -->
+  <path d="M240,463 L420,400" fill="none" stroke="#e74c3c" stroke-width="1.5"/>
+  <path d="M240,479 L420,430" fill="none" stroke="#222" stroke-width="1.5"/>
+  <path d="M240,495 L420,520" fill="none" stroke="#2980ff" stroke-width="1.8"/>
+
+  <!-- Wires: BH1750 -->
+  <path d="M240,572 L420,400" fill="none" stroke="#e74c3c" stroke-width="1.5"/>
+  <path d="M240,588 L420,430" fill="none" stroke="#222" stroke-width="1.5"/>
+  <path d="M240,604 L420,550" fill="none" stroke="#2ecc71" stroke-width="1.8"/>
+  <path d="M240,618 L420,580" fill="none" stroke="#2ecc71" stroke-width="1.8"/>
+
+  <!-- Wire: Power to ESP32 -->
+  <path d="M850,405 L700,405" fill="none" stroke="#c98a3e" stroke-width="2.5"/>
+  <text x="775" y="398" text-anchor="middle" font-size="10" fill="#7a4a10">5V / VIN</text>
+
+  <!-- Legend box -->
+  <rect x="850" y="120" width="200" height="170" rx="8" fill="#fbfbfb" stroke="#cccccc" stroke-width="1"/>
+  <text x="870" y="145" font-size="12" font-weight="bold" fill="#1a3c34">Pin Assignment Summary</text>
+  <text x="870" y="167" font-size="10.5" fill="#333">DHT22 data → GPIO4</text>
+  <text x="870" y="185" font-size="10.5" fill="#333">Soil moisture → GPIO34 (ADC)</text>
+  <text x="870" y="203" font-size="10.5" fill="#333">Rain sensor → GPIO35 (ADC)</text>
+  <text x="870" y="221" font-size="10.5" fill="#333">BH1750 SDA → GPIO21</text>
+  <text x="870" y="239" font-size="10.5" fill="#333">BH1750 SCL → GPIO22</text>
+  <text x="870" y="257" font-size="10.5" fill="#333">All sensor VCC → 3V3</text>
+  <text x="870" y="275" font-size="10.5" fill="#333">All GND → common GND</text>
+</svg>
