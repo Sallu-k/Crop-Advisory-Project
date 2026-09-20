@@ -1,26 +1,42 @@
-# Hardware Folder — Setup Instructions
+# Hardware Folder — Setup Instructions (v2)
+
+## What changed from v1
+
+- **BH1750 light sensor removed.** It was never actually used by the
+  advisory logic — three well-integrated sensors beat four half-integrated
+  ones. If you want light data later, add it back deliberately.
+- **No NTP time sync.** The ESP32 no longer needs to know the date at all —
+  `days_since_sowing` is now computed on the backend from a configured
+  sowing date (see the main `README.md`, `SOWING_DATE` in `.env`).
+- **DHT22 failures are now honest.** If the sensor fails to read, the
+  firmware **omits** temperature/humidity from the payload entirely
+  (sent as absent/null) instead of quietly sending a fake default reading.
+- **Soil moisture is now a 16-sample average**, reducing jitter.
+- **The rain sensor reading is now actually sent** to the backend (in v1 it
+  was read and printed but never transmitted).
+- **`config.h` is now `config.example.h`.** Copy it to `config.h` yourself
+  — `config.h` contains your real Wi-Fi password and device key, and is
+  gitignored so it never gets committed.
 
 ## What's in this folder
 
 | File | What it is |
 |---|---|
-| `block_diagram.svg` | System-level architecture: field node → backend → LLM → Twilio → farmer |
-| `flow_diagram.svg` | Firmware logic flowchart: what the ESP32 does step by step in `loop()` |
-| `circuit_diagram.svg` | Wiring diagram: exact pin connections between ESP32 and each sensor |
-| `config.h` | Your Wi-Fi credentials, backend URL, pin numbers, sowing date |
-| `crop_advisory_node.ino` | Main firmware — reads sensors, POSTs to backend |
+| `block_diagram.svg` | System-level architecture (v2, includes the state manager) |
+| `flow_diagram.svg` | Firmware logic flowchart — matches `crop_advisory_node.ino` exactly |
+| `circuit_diagram.svg` | Wiring diagram: DHT22, soil moisture, rain sensor only |
+| `config.example.h` | Template — copy to `config.h` and fill in your real values |
+| `crop_advisory_node.ino` | Main firmware |
 | `soil_calibration.ino` | Run this first to calibrate your soil moisture sensor |
 
 ## Step 1 — Wire it up
 
-Open `circuit_diagram.svg` (any browser opens SVGs directly) and follow the
-connections shown:
+Open `circuit_diagram.svg` in any browser and follow the connections:
 
-- **DHT22**: VCC → 3V3, GND → GND, DATA → GPIO4 (add a 10kΩ resistor between
-  DATA and VCC if your module doesn't already have one built in)
+- **DHT22**: VCC → 3V3, GND → GND, DATA → GPIO4 (add a 10kΩ pull-up resistor
+  between DATA and VCC if your module doesn't already have one built in)
 - **Capacitive soil moisture sensor**: VCC → 3V3, GND → GND, AOUT → GPIO34
 - **FC-37 rain sensor**: VCC → 3V3, GND → GND, AOUT → GPIO35
-- **BH1750 (optional)**: VCC → 3V3, GND → GND, SDA → GPIO21, SCL → GPIO22
 
 All grounds are common — connect every sensor's GND to the same ground rail
 as the ESP32.
@@ -42,7 +58,8 @@ install:
 - **DHT sensor library** (by Adafruit)
 - **Adafruit Unified Sensor** (installs automatically as a dependency)
 - **ArduinoJson** (by Benoit Blanchon)
-- **BH1750** (by Christopher Laws) — only needed if you're using the light sensor
+
+(BH1750 is no longer needed.)
 
 ## Step 4 — Calibrate the soil moisture sensor
 
@@ -52,21 +69,25 @@ install:
    `SOIL_ADC_DRY` value.
 4. Submerge the sensor tip fully in a glass of water — note that number.
    This is your `SOIL_ADC_WET` value.
-5. Open `config.h` and replace the placeholder `SOIL_ADC_DRY` /
-   `SOIL_ADC_WET` values with your real numbers.
+5. Open `config.h` (see Step 5) and set those two values.
 
-This step matters — skipping it means your moisture percentage readings
-will be meaningless, since every sensor unit reads slightly differently.
+This step matters — skipping it means your moisture index will be
+meaningless, since every sensor unit reads slightly differently. Also
+note: this gives you a **relative moisture index**, not a laboratory
+volumetric-water-content measurement — describe it that way in your pitch.
 
-## Step 5 — Fill in config.h
+## Step 5 — Create and fill in config.h
 
-Open `config.h` and set:
-- `WIFI_SSID` / `WIFI_PASSWORD` — your Wi-Fi hotspot credentials
-- `BACKEND_URL` — your deployed Render URL with `/sensor-data` at the end
-  (e.g. `https://crop-advisory-backend-xxxx.onrender.com/sensor-data`)
-- `SOWING_YEAR` / `SOWING_MONTH` / `SOWING_DAY` — the date you're treating
-  as the paddy sowing date for this demo
-- The calibrated `SOIL_ADC_DRY` / `SOIL_ADC_WET` values from Step 4
+1. Copy `config.example.h` and rename the copy to `config.h`.
+2. Open `config.h` and set:
+   - `WIFI_SSID` / `WIFI_PASSWORD` — your Wi-Fi hotspot credentials
+   - `BACKEND_URL` — your deployed Render URL with `/sensor-data` at the end
+   - `DEVICE_ID` — must match what your backend expects (default `FIELD-001`)
+   - `DEVICE_KEY` — must match `EXPECTED_DEVICE_KEY` in your backend's `.env`
+   - The calibrated `SOIL_ADC_DRY` / `SOIL_ADC_WET` values from Step 4
+
+`config.h` is gitignored — it will never be committed, since it holds your
+real Wi-Fi password and device key.
 
 ## Step 6 — Upload and test the main firmware
 
@@ -74,22 +95,35 @@ Open `config.h` and set:
    the same folder — Arduino IDE will show both as tabs).
 2. Upload it to your ESP32.
 3. Open Serial Monitor at `115200` baud. You should see it connect to
-   Wi-Fi, sync time, then start printing sensor readings and confirming
-   each POST to your backend every 5 minutes (or your configured interval).
-4. Check your phone — each successful send should trigger a real call and
-   SMS from the backend you already built.
+   Wi-Fi, then start printing sensor readings and confirming each POST to
+   your backend every 5 minutes (or your configured interval).
+4. Because of the backend's new state-change logic, you will **only** get a
+   real call/SMS when a condition is NEW or has cleared its cooldown — an
+   unchanged "still dry" reading every 5 minutes will NOT re-trigger a call.
+   This is intentional (see the main README's "What changed" section).
 
 ## Testing tips
 
 - **For faster demo testing**, temporarily lower `READING_INTERVAL_MS` in
-  `config.h` (e.g. to `30000` for 30 seconds) so you don't have to wait
-  5 minutes between readings while debugging. Set it back to something
-  reasonable (like 5 minutes) before the actual showcase.
-- **To simulate different scenarios live** (e.g. "dry soil" vs "normal"),
-  physically dip the soil sensor in water or pull it out into dry air —
-  the moisture reading will change in real time, which is a great visual
-  moment for judges: wet the soil, watch the reading change, and a few
-  seconds later your phone rings with an updated advisory.
-- **Wi-Fi troubleshooting**: if the ESP32 keeps failing to connect, double
-  check the SSID/password have no typos, and that you're on a 2.4GHz
-  network — the ESP32 cannot connect to 5GHz-only Wi-Fi.
+  `config.h` (e.g. to `30000` for 30 seconds), and lower
+  `ALERT_COOLDOWN_MINUTES` in the backend's `.env` (e.g. to `1`) so you can
+  see repeated alerts fire during development. Set both back to realistic
+  values (5 min / 720 min) before the actual showcase.
+- **To simulate different scenarios live**, physically dip the soil sensor
+  in water or pull it out into dry air — the moisture reading changes in
+  real time. A good demo sequence: show it dry (triggers a call), then show
+  it "still dry" a few minutes later (no second call — this proves the
+  anti-spam fix works), then unplug the DHT22 (triggers an honest sensor-
+  fault alert instead of fake data).
+- **Wi-Fi troubleshooting**: double-check the SSID/password have no typos,
+  and that you're on a 2.4GHz network — the ESP32 cannot connect to
+  5GHz-only Wi-Fi.
+
+## What was deliberately NOT built this week (and why)
+
+- **Solar + battery power.** A 6V panel is not safely compatible with a
+  typical 5V-input TP4056 charger without additional regulation — that's a
+  real subsystem to design properly, not a one-week add-on. Use USB power
+  for the prototype and mention solar as future work.
+- **BH1750 / additional sensors.** Adding sensors the rule engine doesn't
+  actually use just adds wiring risk for zero functional benefit.

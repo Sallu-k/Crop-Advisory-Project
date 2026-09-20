@@ -1,18 +1,24 @@
 """
 Fetches a short-range rain forecast using Open-Meteo (free, no API key required).
 Docs: https://open-meteo.com/en/docs
+
+IMPORTANT: on failure this returns {"available": False, "rain_expected": None},
+NEVER {"rain_expected": False}. A failed API call means "we don't know", not
+"no rain" -- silently treating unknown as "safe/no" is a real correctness bug,
+not just a style choice, since it could suppress a genuine rain warning.
 """
 import requests
 from config import LOCATION_LAT, LOCATION_LON
 
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+RAIN_THRESHOLD_MM = 5.0
 
 
-def get_rain_risk_next_3_days() -> bool:
+def get_weather() -> dict:
     """
-    Returns True if meaningful rain (>= 5mm on any of the next 3 days) is forecast.
-    Falls back to False (no known rain risk) if the API call fails, so a network
-    hiccup never crashes the whole advisory pipeline.
+    Returns a structured dict:
+      {"available": True,  "rain_expected": bool, "forecast": [{"date": ..., "rain_mm": ...}, ...]}
+      {"available": False, "rain_expected": None, "forecast": None}
     """
     try:
         params = {
@@ -25,8 +31,15 @@ def get_rain_risk_next_3_days() -> bool:
         response = requests.get(OPEN_METEO_URL, params=params, timeout=10)
         response.raise_for_status()
         data = response.json()
-        daily_precip = data.get("daily", {}).get("precipitation_sum", [])
-        return any(mm >= 5.0 for mm in daily_precip)
+
+        dates = data.get("daily", {}).get("time", [])
+        rain_values = data.get("daily", {}).get("precipitation_sum", [])
+        forecast = [
+            {"date": d, "rain_mm": mm} for d, mm in zip(dates, rain_values)
+        ]
+        rain_expected = any(mm >= RAIN_THRESHOLD_MM for mm in rain_values)
+
+        return {"available": True, "rain_expected": rain_expected, "forecast": forecast}
     except Exception as e:
-        print(f"[weather.py] Weather API call failed, defaulting to no rain risk: {e}")
-        return False
+        print(f"[weather.py] Weather API call failed, marking as unavailable: {e}")
+        return {"available": False, "rain_expected": None, "forecast": None}

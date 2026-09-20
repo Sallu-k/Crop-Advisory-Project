@@ -1,103 +1,174 @@
 """
-Main FastAPI app.
+Main FastAPI app -- v2.
 
-POST /sensor-data  -> full pipeline: rule engine -> weather/mandi enrichment
-                      -> LLM paraphrase -> Twilio voice call + SMS
-GET  /              -> health check
-GET  /test-advisory -> runs the pipeline with sample hardcoded values (no
-                       need to POST anything -- useful for quick browser testing)
+Key behavior change from v1: a sensor reading only results in a phone
+call/SMS when something ACTUALLY changed (new condition, or an existing one
+crossed its cooldown period). An unchanged "still dry" reading every 5
+minutes does NOT re-trigger delivery. This also means weather/mandi/LLM/
+Twilio are only called when there's actually something to say -- not on
+every single reading.
 """
-from fastapi import FastAPI
-from pydantic import BaseModel
+from datetime import datetime
 
-from rule_engine import evaluate
-from weather import get_rain_risk_next_3_days
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import HTMLResponse
+
+from models import SensorData
+from rule_engine import evaluate, compute_days_since_sowing
+from weather import get_weather
 from mandi import get_mandi_price
-from llm import generate_advisory_message
+from message_planner import build_voice_message, build_sms_message
 from telephony import send_sms, make_voice_call
+from dashboard import render_dashboard
+import state_manager
+from config import EXPECTED_DEVICE_KEY, SOWING_DATE
 
-app = FastAPI(title="Crop Advisory Backend")
-
-
-class SensorData(BaseModel):
-    soil_moisture: float       # e.g. 0-100 (qualitative band from capacitive sensor)
-    temperature: float         # Celsius
-    humidity: float            # percent
-    days_since_sowing: int     # how many days since the paddy was sown
+app = FastAPI(title="Crop Advisory Backend v2")
 
 
-def run_pipeline(data: SensorData, deliver: bool = True) -> dict:
-    """Runs the full pipeline and optionally delivers the call/SMS."""
-    rain_risk = get_rain_risk_next_3_days()
-    mandi_price = get_mandi_price()
+def _check_device_key(x_device_key: str = None):
+    """
+    Simple shared-secret check. If EXPECTED_DEVICE_KEY is not configured,
+    the check is skipped entirely (useful for local testing) -- but for any
+    real deployment, set EXPECTED_DEVICE_KEY so random requests can't
+    trigger a real phone call.
+    """
+    if EXPECTED_DEVICE_KEY and x_device_key != EXPECTED_DEVICE_KEY:
+        raise HTTPException(status_code=401, detail="Invalid or missing device key")
 
-    facts = evaluate(
+
+def run_pipeline(data: SensorData, deliver: bool, is_preview: bool = False) -> dict:
+    device_id = "PREVIEW-TEST" if is_preview else data.device_id
+
+    # ---- Duplicate/retry detection (skipped for preview so it can be reused freely) ----
+    if not is_preview:
+        if state_manager.is_duplicate_sequence(device_id, data.sequence):
+            return {"success": True, "duplicate": True, "message": "Duplicate/retried sequence number, ignored."}
+        state_manager.record_sequence(device_id, data.sequence)
+
+    previous_moisture_state = None if is_preview else state_manager.get_previous_moisture_state(device_id)
+    days_since_sowing = compute_days_since_sowing(SOWING_DATE)
+
+    # ---- First pass: evaluate WITHOUT external context, to see if anything changed ----
+    result = evaluate(
         soil_moisture=data.soil_moisture,
         temperature=data.temperature,
         humidity=data.humidity,
-        days_since_sowing=data.days_since_sowing,
-        rain_risk_next_3_days=rain_risk,
-        mandi_price=mandi_price,
+        raining=data.raining,
+        days_since_sowing=days_since_sowing,
+        previous_moisture_state=previous_moisture_state,
     )
 
-    message = generate_advisory_message(facts)
+    if not is_preview:
+        state_manager.update_moisture_state(device_id, result["moisture_state"])
+        new_alerts = state_manager.get_new_alerts(device_id, result["alert_codes"])
+    else:
+        # Preview always treats every active code as "new" so you can see the
+        # full message for any scenario, without cooldown/state interference.
+        new_alerts = [c for c in result["alert_codes"] if c in state_manager.ACTIONABLE_CODES]
 
-    result = {"facts": facts, "message": message}
+    response = {
+        "success": True,
+        "device_id": device_id,
+        "timestamp": datetime.now().isoformat(),
+        "sensor": {
+            "soil_moisture_index": data.soil_moisture,
+            "temperature_c": data.temperature,
+            "humidity_percent": data.humidity,
+            "rain_detected_now": data.raining,
+        },
+        "days_since_sowing": days_since_sowing,
+        "current_alert_codes": result["alert_codes"],
+        "new_alert_codes": new_alerts,
+    }
+
+    if not new_alerts:
+        response["action_taken"] = "none (no new or renewed alert conditions)"
+        if not is_preview:
+            state_manager.save_snapshot(device_id, {"facts": result["facts"], "alert_codes": result["alert_codes"]})
+        return response
+
+    # ---- Only now (something to say) do we fetch external context ----
+    weather = get_weather()
+    mandi = get_mandi_price()
+
+    result_with_context = evaluate(
+        soil_moisture=data.soil_moisture,
+        temperature=data.temperature,
+        humidity=data.humidity,
+        raining=data.raining,
+        days_since_sowing=days_since_sowing,
+        previous_moisture_state=previous_moisture_state,
+        weather=weather,
+        mandi=mandi,
+    )
+    facts = result_with_context["facts"]
+
+    voice_message = build_voice_message(new_alerts)
+    sms_message = build_sms_message(result_with_context["alert_codes"], facts)
+
+    response["facts"] = facts
+    response["voice_message"] = voice_message
+    response["sms_message"] = sms_message
 
     if deliver:
-        sms_result = send_sms(message)
-        call_result = make_voice_call(message)
-        result["sms_result"] = sms_result
-        result["call_result"] = call_result
+        sms_result = send_sms(sms_message)
+        call_result = make_voice_call(voice_message)
+        response["delivery"] = {
+            "voice_status": "sent" if call_result.get("success") else f"failed: {call_result.get('error', call_result.get('status_code'))}",
+            "sms_status": "sent" if sms_result.get("success") else f"failed: {sms_result.get('error', sms_result.get('status_code'))}",
+        }
 
-    return result
+    if not is_preview:
+        state_manager.save_snapshot(device_id, {
+            "facts": facts,
+            "alert_codes": result_with_context["alert_codes"],
+            "delivery": response.get("delivery"),
+        })
+
+    return response
 
 
 @app.get("/")
 def health_check():
-    return {"status": "backend is alive"}
+    return {"status": "backend is alive", "version": "v2"}
 
 
 @app.post("/sensor-data")
-def receive_sensor_data(data: SensorData):
+def receive_sensor_data(data: SensorData, x_device_key: str = Header(default=None)):
+    _check_device_key(x_device_key)
     return run_pipeline(data, deliver=True)
 
 
 @app.post("/sensor-data-preview")
 def preview_sensor_data(data: SensorData):
     """
-    Same as /sensor-data but NEVER places a call or sends an SMS.
-    Use this to test as many custom sensor value combinations as you want
-    (dry soil, wet soil, different days_since_sowing, etc.) without using up
-    any of your limited Twilio SMS/call quota. Only switch to the real
-    /sensor-data endpoint once you're confident the logic is correct.
+    No device key required, never delivers, never touches real device state.
+    Use this to test any combination of values without using Twilio quota
+    or disturbing your real device's cooldown/state tracking.
     """
-    return run_pipeline(data, deliver=False)
+    return run_pipeline(data, deliver=False, is_preview=True)
 
 
-@app.get("/test-advisory")
-def test_advisory():
+@app.post("/demo/trigger")
+def demo_trigger(x_device_key: str = Header(default=None)):
     """
-    Quick manual test with no need to construct a JSON body -- just open this
-    URL in a browser (locally or on Render) to trigger the full pipeline with
-    sample values simulating a dry field, 20 days after sowing.
+    A POST (not GET) endpoint for triggering a real demo call with fixed
+    sample values -- deliberately not a GET, since GET requests should never
+    have side effects like placing a phone call.
     """
+    _check_device_key(x_device_key)
     sample = SensorData(
+        device_id="DEMO",
+        sequence=int(datetime.now().timestamp()),
         soil_moisture=20.0,
         temperature=29.5,
         humidity=68.0,
-        days_since_sowing=20,
+        raining=False,
     )
     return run_pipeline(sample, deliver=True)
 
 
-@app.get("/test-advisory-no-call")
-def test_advisory_no_call():
-    """Same as above but does NOT place a call/SMS -- just shows what would be sent."""
-    sample = SensorData(
-        soil_moisture=20.0,
-        temperature=29.5,
-        humidity=68.0,
-        days_since_sowing=20,
-    )
-    return run_pipeline(sample, deliver=False)
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    return render_dashboard()

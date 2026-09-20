@@ -1,27 +1,46 @@
-// crop_advisory_node.ino
+// crop_advisory_node.ino  (v2)
 //
 // ESP32 field sensor node for the Voice-First Crop Advisory project.
-// Reads soil moisture, temperature/humidity, and rain status, computes
-// days-since-sowing from NTP time, and POSTs a JSON payload to the backend.
+//
+// What changed from v1, and why:
+//  - No NTP time sync. The ESP32 no longer computes days-since-sowing --
+//    that's now done on the BACKEND from a configured sowing date. This
+//    removes an entire failure mode (a bad/missing NTP sync used to
+//    silently produce days_since_sowing = 0, which could wrongly trigger a
+//    basal-fertilizer alert on a 90-day-old crop). The node now knows
+//    almost nothing about farming -- it just reports raw sensor readings.
+//  - DHT22 failure sends NULL for temperature/humidity instead of a fake
+//    plausible-looking number. A missing key in the JSON = sensor fault,
+//    handled honestly by the backend, not hidden.
+//  - Sends device_id + an incrementing sequence number, so the backend can
+//    reject duplicate/retried sends.
+//  - Sends the rain sensor reading (previously read but never transmitted).
+//  - Soil moisture is smoothed by averaging 16 readings, so the number
+//    doesn't jitter around on stage.
+//  - BH1750 light sensor removed -- unused in the current advisory logic,
+//    so it was just visual/wiring noise.
+//  - Sends a device-key header so random requests can't trigger a real call.
 //
 // Required libraries (install via Arduino IDE Library Manager):
 //   - "DHT sensor library" by Adafruit
 //   - "Adafruit Unified Sensor" (dependency of the above)
 //   - "ArduinoJson" by Benoit Blanchon
-//   - "BH1750" by Christopher Laws   (only if using the optional light sensor)
 //
 // Board: any ESP32 DevKit (select "ESP32 Dev Module" in Tools > Board)
 
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
-#include <time.h>
 
 #include "config.h"
 
 DHT dht(DHT_PIN, DHT_TYPE);
+
+// Persists only for as long as the device stays powered on. Resets to 0 on
+// reboot -- for a single-device one-week demo this is an accepted
+// simplification (see state_manager.py comments on the backend side).
+unsigned long sequenceNumber = 0;
 
 // ---------- Wi-Fi connection ----------
 bool connectWiFi() {
@@ -40,72 +59,38 @@ bool connectWiFi() {
     Serial.println("\nWi-Fi connected. IP: " + WiFi.localIP().toString());
     return true;
   }
-  Serial.println("\nWi-Fi connection failed.");
+  Serial.println("\nWi-Fi connection failed after ~15 seconds (30 attempts).");
   return false;
 }
 
-// ---------- NTP time sync ----------
-bool syncTime() {
-  // "IST-5:30" sets the timezone to India Standard Time
-  configTime(5 * 3600 + 1800, 0, "pool.ntp.org", "time.google.com");
-
-  struct tm timeinfo;
-  int attempts = 0;
-  while (!getLocalTime(&timeinfo) && attempts < 10) {
-    Serial.println("Waiting for NTP time sync...");
-    delay(1000);
-    attempts++;
+// ---------- Read soil moisture (averaged, smoothed) and convert to 0-100 index ----------
+// NOTE: this is a relative INDEX derived from calibration, not a laboratory
+// volumetric-water-content measurement. Present it as such.
+float readSoilMoistureIndex() {
+  const int samples = 16;
+  long total = 0;
+  for (int i = 0; i < samples; i++) {
+    total += analogRead(SOIL_PIN);
+    delay(10);
   }
-  return getLocalTime(&timeinfo);
+  float raw = total / (float)samples;
+
+  // For capacitive sensors, a LOWER raw value usually means WETTER soil.
+  float index = 100.0 * ((float)(SOIL_ADC_DRY - raw) / (float)(SOIL_ADC_DRY - SOIL_ADC_WET));
+  if (index < 0) index = 0;
+  if (index > 100) index = 100;
+  return index;
 }
 
-// ---------- Compute days since sowing ----------
-int computeDaysSinceSowing() {
-  struct tm timeinfo;
-  if (!getLocalTime(&timeinfo)) {
-    Serial.println("Time not available, defaulting days_since_sowing to 0");
-    return 0;
-  }
-
-  struct tm sowing_tm = {};
-  sowing_tm.tm_year = SOWING_YEAR - 1900;
-  sowing_tm.tm_mon  = SOWING_MONTH - 1;
-  sowing_tm.tm_mday = SOWING_DAY;
-  sowing_tm.tm_hour = 0;
-  sowing_tm.tm_min  = 0;
-  sowing_tm.tm_sec  = 0;
-
-  time_t now_epoch = mktime(&timeinfo);
-  time_t sowing_epoch = mktime(&sowing_tm);
-
-  double seconds_diff = difftime(now_epoch, sowing_epoch);
-  int days = (int)(seconds_diff / (60 * 60 * 24));
-  return days < 0 ? 0 : days;
-}
-
-// ---------- Read soil moisture and convert to 0-100 scale ----------
-// NOTE: this scale is only as accurate as the SOIL_ADC_DRY / SOIL_ADC_WET
-// calibration values in config.h. Recalibrate for your specific sensor unit.
-float readSoilMoisturePercent() {
-  int raw = analogRead(SOIL_PIN);
-  // Map raw ADC reading to a 0 (dry) - 100 (wet) percentage.
-  // Note: for capacitive sensors, a LOWER raw value usually means WETTER soil.
-  float percent = 100.0 * ((float)(SOIL_ADC_DRY - raw) / (float)(SOIL_ADC_DRY - SOIL_ADC_WET));
-  if (percent < 0) percent = 0;
-  if (percent > 100) percent = 100;
-  return percent;
-}
-
-// ---------- Read rain sensor (digital-style: higher analog = drier) ----------
+// ---------- Read rain sensor (lower analog reading = more water detected) ----------
 bool readIsRaining() {
   int raw = analogRead(RAIN_PIN);
-  // FC-37: lower analog reading generally means more water detected.
-  // Threshold below is a starting point -- tune based on your module's behavior.
+  // Starting threshold -- tune based on your specific module's dry/wet readings.
   return raw < 2000;
 }
 
 // ---------- Send JSON payload to backend ----------
-bool sendSensorData(float soilMoisture, float temperature, float humidity, int daysSinceSowing) {
+bool sendSensorData(float soilMoisture, bool dhtOk, float temperature, float humidity, bool raining) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi not connected, skipping send.");
     return false;
@@ -114,13 +99,22 @@ bool sendSensorData(float soilMoisture, float temperature, float humidity, int d
   HTTPClient http;
   http.begin(BACKEND_URL);
   http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-Device-Key", DEVICE_KEY);
   http.setTimeout(15000);
 
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<320> doc;
+  doc["device_id"] = DEVICE_ID;
+  doc["sequence"] = sequenceNumber;
   doc["soil_moisture"] = soilMoisture;
-  doc["temperature"] = temperature;
-  doc["humidity"] = humidity;
-  doc["days_since_sowing"] = daysSinceSowing;
+  doc["raining"] = raining;
+
+  // Only include temperature/humidity if the DHT22 read succeeded --
+  // otherwise leave them out entirely so the backend receives null,
+  // which correctly triggers a SENSOR_FAULT alert instead of a fake reading.
+  if (dhtOk) {
+    doc["temperature"] = temperature;
+    doc["humidity"] = humidity;
+  }
 
   String payload;
   serializeJson(doc, payload);
@@ -145,17 +139,13 @@ bool sendSensorData(float soilMoisture, float temperature, float humidity, int d
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== Crop Advisory Field Node Starting ===");
+  Serial.println("\n=== Crop Advisory Field Node Starting (v2) ===");
 
   dht.begin();
-
-  if (connectWiFi()) {
-    syncTime();
-  }
+  connectWiFi();
 }
 
 void loop() {
-  // Make sure Wi-Fi is still connected; reconnect if it dropped.
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi dropped, reconnecting...");
     connectWiFi();
@@ -163,27 +153,31 @@ void loop() {
 
   float humidity = dht.readHumidity();
   float temperature = dht.readTemperature();
+  bool dhtOk = !(isnan(humidity) || isnan(temperature));
 
-  if (isnan(humidity) || isnan(temperature)) {
-    Serial.println("DHT22 read failed, using last-known safe defaults.");
-    humidity = 60.0;
-    temperature = 28.0;
+  if (!dhtOk) {
+    Serial.println("DHT22 read failed -- reporting sensor fault (NOT fabricating a value).");
   }
 
-  float soilMoisture = readSoilMoisturePercent();
+  float soilMoisture = readSoilMoistureIndex();
   bool raining = readIsRaining();
-  int daysSinceSowing = computeDaysSinceSowing();
 
   Serial.println("---- Readings ----");
-  Serial.printf("Soil moisture: %.1f %%\n", soilMoisture);
-  Serial.printf("Temperature: %.1f C\n", temperature);
-  Serial.printf("Humidity: %.1f %%\n", humidity);
+  Serial.printf("Soil moisture index: %.1f / 100\n", soilMoisture);
+  if (dhtOk) {
+    Serial.printf("Temperature: %.1f C\n", temperature);
+    Serial.printf("Humidity: %.1f %%\n", humidity);
+  } else {
+    Serial.println("Temperature/Humidity: FAULT (DHT22 not responding)");
+  }
   Serial.printf("Raining now: %s\n", raining ? "yes" : "no");
-  Serial.printf("Days since sowing: %d\n", daysSinceSowing);
+  Serial.printf("Sequence: %lu\n", sequenceNumber);
 
-  bool sent = sendSensorData(soilMoisture, temperature, humidity, daysSinceSowing);
-  Serial.println(sent ? "Data sent successfully." : "Data send failed (will retry next cycle).");
+  bool sent = sendSensorData(soilMoisture, dhtOk, temperature, humidity, raining);
+  Serial.println(sent ? "Data sent successfully." : "Data send failed (will retry with a fresh reading next cycle).");
 
-  Serial.printf("Sleeping for %lu ms...\n\n", (unsigned long)READING_INTERVAL_MS);
+  sequenceNumber++;
+
+  Serial.printf("Waiting %lu ms until next reading...\n\n", (unsigned long)READING_INTERVAL_MS);
   delay(READING_INTERVAL_MS);
 }

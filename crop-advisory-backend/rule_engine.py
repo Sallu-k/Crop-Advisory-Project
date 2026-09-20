@@ -1,115 +1,176 @@
 """
 Deterministic rule engine for PADDY (Bhatkal / coastal Karnataka, Kharif season).
 
-This is the "brain" of the project. It takes sensor + context data and returns
-a structured dictionary of FACTS ONLY (no sentences). The LLM layer later turns
-these facts into a spoken message -- it never decides anything itself.
+This is the "brain" of the project, and it is intentionally the ONLY place
+that decides anything agronomic. Everything downstream (LLM, SMS templates,
+Twilio) just renders or delivers what this file decides -- nothing else is
+allowed to interpret raw sensor data.
 
-Thresholds below are simplified, illustrative values based on general ICAR/KVK
-paddy package-of-practices guidance (sowing window, fertilizer staging,
-~110-120 days to maturity for typical varieties). For a real deployment these
-would be sourced from your local KVK's exact variety-specific recommendation --
-that caveat is worth stating openly in your demo.
+Key design choices (see the full audit this addresses for reasoning):
+  - Hysteresis bands instead of single thresholds, so a reading sitting near
+    a boundary doesn't flicker between states on sensor noise.
+  - A missing/failed sensor reading (None) produces a SENSOR_FAULT alert
+    code -- it is NEVER silently replaced with a plausible fake number.
+  - "Harvest" produces a HARVEST_CHECK_DUE alert, not a command -- the
+    actual harvest decision (grain color/moisture) is left to the farmer.
+  - Every fact returned here is traceable to a specific rule with a source
+    (see agronomy/paddy_profile.py and agronomy/AGRONOMY_SOURCES.md).
 """
+from datetime import date, datetime
 
-from datetime import date
-
-# --- Reference data for Paddy (Kharif, coastal Karnataka) ---
-SOWING_WINDOW = {
-    "start_month": 6, "start_day": 1,    # June 1
-    "end_month": 7, "end_day": 15,       # July 15
-}
-
-DAYS_TO_MATURITY = 115  # typical range 110-120 days after sowing for common varieties
-
-# Fertilizer schedule: (days_after_sowing_range, stage_name, recommendation)
-FERTILIZER_SCHEDULE = [
-    (0, 0, "basal", "Apply basal dose of N-P-K fertilizer at the time of sowing/transplanting."),
-    (18, 25, "tillering", "Apply first top-dressing of nitrogen fertilizer during the tillering stage."),
-    (40, 50, "panicle_initiation", "Apply second top-dressing of nitrogen at panicle initiation stage."),
-]
-
-# Soil moisture thresholds (from the capacitive sensor's raw analog band, calibrated
-# loosely to dry / moist / wet -- treat as qualitative, not a precise percentage)
-MOISTURE_DRY_THRESHOLD = 30.0     # below this = needs irrigation
-MOISTURE_WET_THRESHOLD = 70.0     # above this = waterlogged risk
+from agronomy.paddy_profile import (
+    RULE_VERSION,
+    CROP_PROFILE,
+    MOISTURE_LOW_ENTER,
+    MOISTURE_LOW_EXIT,
+    MOISTURE_HIGH_ENTER,
+    MOISTURE_HIGH_EXIT,
+    FERTILIZER_RULES,
+    HARVEST_APPROACHING_WINDOW_DAYS,
+)
 
 
-def _is_within_sowing_window(today: date) -> bool:
-    start = date(today.year, SOWING_WINDOW["start_month"], SOWING_WINDOW["start_day"])
-    end = date(today.year, SOWING_WINDOW["end_month"], SOWING_WINDOW["end_day"])
-    return start <= today <= end
+def compute_days_since_sowing(sowing_date_str: str, today: date = None) -> int:
+    """
+    Computed on the BACKEND using a configured sowing date -- the ESP32 does
+    not need NTP time sync or any knowledge of the calendar at all. This
+    removes an entire class of firmware failure (a bad NTP sync used to
+    silently produce days_since_sowing = 0, which could wrongly trigger a
+    basal-fertilizer alert on a 90-day-old crop).
+    """
+    if today is None:
+        today = date.today()
+    sowing_date = datetime.strptime(sowing_date_str, "%Y-%m-%d").date()
+    days = (today - sowing_date).days
+    return max(days, 0)
 
 
-def _fertilizer_status(days_since_sowing: int):
-    for lo, hi, stage, message in FERTILIZER_SCHEDULE:
-        if lo <= days_since_sowing <= hi:
-            return {"stage": stage, "due": True, "recommendation": message}
-    return {"stage": None, "due": False, "recommendation": None}
-
-
-def _moisture_status(soil_moisture: float) -> str:
-    if soil_moisture < MOISTURE_DRY_THRESHOLD:
+def _moisture_state(soil_moisture: float, previous_state: str) -> str:
+    """
+    Hysteresis-based state machine for soil moisture.
+    previous_state is one of: "low", "normal", "high" (or None on first read).
+    """
+    if previous_state == "low":
+        if soil_moisture >= MOISTURE_LOW_EXIT:
+            return "normal"
         return "low"
-    elif soil_moisture > MOISTURE_WET_THRESHOLD:
+    if previous_state == "high":
+        if soil_moisture <= MOISTURE_HIGH_EXIT:
+            return "normal"
+        return "high"
+    # previous_state is "normal" or unknown -- use the enter thresholds
+    if soil_moisture < MOISTURE_LOW_ENTER:
+        return "low"
+    if soil_moisture > MOISTURE_HIGH_ENTER:
         return "high"
     return "normal"
 
 
-def _harvest_status(days_since_sowing: int) -> dict:
-    days_remaining = DAYS_TO_MATURITY - days_since_sowing
-    ready = days_remaining <= 0
-    approaching = 0 < days_remaining <= 10
+def _fertilizer_alert(days_since_sowing: int):
+    for rule in FERTILIZER_RULES:
+        lo, hi = rule["window"]
+        if lo <= days_since_sowing <= hi:
+            return rule
+    return None
+
+
+def _harvest_state(days_since_sowing: int) -> dict:
+    maturity_days = CROP_PROFILE["maturity_days"]
+    days_remaining = maturity_days - days_since_sowing
     return {
         "days_remaining_estimate": max(days_remaining, 0),
-        "ready_to_harvest": ready,
-        "approaching_harvest": approaching,
+        "harvest_check_due": days_remaining <= 0,
+        "harvest_approaching": 0 < days_remaining <= HARVEST_APPROACHING_WINDOW_DAYS,
     }
 
 
 def evaluate(
-    soil_moisture: float,
-    temperature: float,
-    humidity: float,
+    soil_moisture,          # float or None
+    temperature,            # float or None
+    humidity,               # float or None
+    raining,                # bool or None (from the rain sensor, "right now")
     days_since_sowing: int,
-    rain_risk_next_3_days: bool = False,
-    mandi_price: float = None,
+    previous_moisture_state: str = None,
+    weather: dict = None,   # {"available": bool, "rain_expected": bool or None, "forecast": [...]}
+    mandi: dict = None,     # {"available": bool, "modal_price": float, "market": str, ...}
 ) -> dict:
     """
-    Main entry point. Returns a structured facts dictionary -- this is the ONLY
-    source of truth that gets passed to the LLM for paraphrasing.
+    Main entry point. Returns:
+      - facts: full structured state (for the dashboard / SMS template)
+      - alert_codes: the list of conditions currently active (state_manager
+        decides which of these actually warrant sending a new notification)
     """
-    today = date.today()
-    moisture_status = _moisture_status(soil_moisture)
-    fertilizer = _fertilizer_status(days_since_sowing)
-    harvest = _harvest_status(days_since_sowing)
+    alert_codes = []
+    sensor_faults = []
+
+    # ---- DHT22 sensor fault handling: never fabricate ----
+    if temperature is None or humidity is None:
+        sensor_faults.append("SENSOR_FAULT_DHT22")
+        alert_codes.append("SENSOR_FAULT_DHT22")
+
+    # ---- Soil moisture (hysteresis state machine) ----
+    moisture_state = None
+    if soil_moisture is not None:
+        moisture_state = _moisture_state(soil_moisture, previous_moisture_state)
+        if moisture_state == "low":
+            alert_codes.append("LOW_MOISTURE")
+        elif moisture_state == "high":
+            alert_codes.append("EXCESS_MOISTURE")
+    else:
+        sensor_faults.append("SENSOR_FAULT_SOIL")
+        alert_codes.append("SENSOR_FAULT_SOIL")
+
+    # ---- Fertilizer schedule ----
+    fert_rule = _fertilizer_alert(days_since_sowing)
+    if fert_rule:
+        alert_codes.append(fert_rule["alert_code"])
+
+    # ---- Harvest check (not a harvest command) ----
+    harvest = _harvest_state(days_since_sowing)
+    if harvest["harvest_check_due"]:
+        alert_codes.append("HARVEST_CHECK_DUE")
+    elif harvest["harvest_approaching"]:
+        alert_codes.append("HARVEST_APPROACHING")
+
+    # ---- Rain warning: only meaningful near harvest, and only if the
+    #      weather API actually returned data (unknown != "no rain") ----
+    rain_expected = None
+    weather_available = bool(weather and weather.get("available"))
+    if weather_available:
+        rain_expected = weather.get("rain_expected")
+        if rain_expected and (harvest["harvest_check_due"] or harvest["harvest_approaching"]):
+            alert_codes.append("RAIN_WARNING")
+    else:
+        alert_codes.append("WEATHER_UNAVAILABLE")
 
     facts = {
-        "crop": "paddy",
-        "location": "Bhatkal",
-        "date": today.isoformat(),
+        "rule_version": RULE_VERSION,
+        "crop_profile": CROP_PROFILE,
         "days_since_sowing": days_since_sowing,
 
-        "in_sowing_window": _is_within_sowing_window(today),
-
-        "moisture_status": moisture_status,
-        "irrigation_needed": moisture_status == "low",
-        "waterlogging_risk": moisture_status == "high",
+        "soil_moisture_index": soil_moisture,   # explicitly an INDEX, not volumetric %
+        "moisture_state": moisture_state,       # "low" / "normal" / "high" / None (fault)
 
         "temperature_c": temperature,
         "humidity_percent": humidity,
+        "sensor_faults": sensor_faults,
 
-        "fertilizer_stage": fertilizer["stage"],
-        "fertilizer_due": fertilizer["due"],
-        "fertilizer_recommendation": fertilizer["recommendation"],
+        "rain_detected_now": raining,           # from the physical rain sensor (None = not sent / unknown)
+        "weather_available": weather_available,
+        "rain_expected_next_days": rain_expected,   # True / False / None (None = unknown, NOT "no rain")
+        "weather_forecast": (weather or {}).get("forecast"),
+
+        "fertilizer_due_rule": fert_rule,       # includes id, description, source -- or None
 
         "days_remaining_to_harvest_estimate": harvest["days_remaining_estimate"],
-        "approaching_harvest": harvest["approaching_harvest"],
-        "ready_to_harvest": harvest["ready_to_harvest"],
+        "harvest_approaching": harvest["harvest_approaching"],
+        "harvest_check_due": harvest["harvest_check_due"],
 
-        "rain_risk_next_3_days": rain_risk_next_3_days,
-        "harvest_rain_warning": harvest["approaching_harvest"] and rain_risk_next_3_days,
-
-        "mandi_price_per_quintal": mandi_price,
+        "mandi": mandi or {"available": False},
     }
-    return facts
+
+    return {
+        "facts": facts,
+        "alert_codes": sorted(set(alert_codes)),
+        "moisture_state": moisture_state,  # returned separately so main.py can persist it for hysteresis
+    }
