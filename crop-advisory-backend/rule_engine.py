@@ -93,6 +93,7 @@ def evaluate(
     previous_moisture_state: str = None,
     weather: dict = None,   # {"available": bool, "rain_expected": bool or None, "forecast": [...]}
     mandi: dict = None,     # {"available": bool, "modal_price": float, "market": str, ...}
+    light_level=None,       # float or None -- ambient light index (LDR). Informational only, never gates an alert.
 ) -> dict:
     """
     Main entry point. Returns:
@@ -159,6 +160,8 @@ def evaluate(
         "weather_available": weather_available,
         "rain_expected_next_days": rain_expected,   # True / False / None (None = unknown, NOT "no rain")
         "weather_forecast": (weather or {}).get("forecast"),
+
+        "light_level": light_level,             # LDR-derived ambient light index (0-100), informational only
 
         "fertilizer_due_rule": fert_rule,       # includes id, description, source -- or None
 

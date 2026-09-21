@@ -1,129 +1,129 @@
-# Hardware Folder — Setup Instructions (v2)
+# Hardware Folder — Setup Instructions (v3, matches your actual components)
 
-## What changed from v1
+## Your hardware
 
-- **BH1750 light sensor removed.** It was never actually used by the
-  advisory logic — three well-integrated sensors beat four half-integrated
-  ones. If you want light data later, add it back deliberately.
-- **No NTP time sync.** The ESP32 no longer needs to know the date at all —
-  `days_since_sowing` is now computed on the backend from a configured
-  sowing date (see the main `README.md`, `SOWING_DATE` in `.env`).
-- **DHT22 failures are now honest.** If the sensor fails to read, the
-  firmware **omits** temperature/humidity from the payload entirely
-  (sent as absent/null) instead of quietly sending a fake default reading.
-- **Soil moisture is now a 16-sample average**, reducing jitter.
-- **The rain sensor reading is now actually sent** to the backend (in v1 it
-  was read and printed but never transmitted).
-- **`config.h` is now `config.example.h`.** Copy it to `config.h` yourself
-  — `config.h` contains your real Wi-Fi password and device key, and is
-  gitignored so it never gets committed.
+- ESP32-WROOM-32 DevKit
+- DHT22 temperature/humidity sensor
+- FC-28 soil moisture sensor (probe + LM393 comparator board)
+- MH-RD rain plate (plate + LM393 comparator board)
+- LM393 LDR module (ambient light — 4 pins: VCC, GND, D0, A0)
 
 ## What's in this folder
 
 | File | What it is |
 |---|---|
-| `block_diagram.svg` | System-level architecture (v2, includes the state manager) |
+| `block_diagram.svg` | System-level architecture |
 | `flow_diagram.svg` | Firmware logic flowchart — matches `crop_advisory_node.ino` exactly |
-| `circuit_diagram.svg` | Wiring diagram: DHT22, soil moisture, rain sensor only |
+| `circuit_diagram.svg` | Wiring diagram for your exact 4 modules |
 | `config.example.h` | Template — copy to `config.h` and fill in your real values |
 | `crop_advisory_node.ino` | Main firmware |
-| `soil_calibration.ino` | Run this first to calibrate your soil moisture sensor |
+| `analog_sensor_calibration.ino` | Run this first — calibrates soil, rain, and LDR together in one pass |
 
-## Step 1 — Wire it up
+## Step-by-step: what to do right now
 
-Open `circuit_diagram.svg` in any browser and follow the connections:
+### Step 1 — Wire everything (do this before touching any code)
 
-- **DHT22**: VCC → 3V3, GND → GND, DATA → GPIO4 (add a 10kΩ pull-up resistor
-  between DATA and VCC if your module doesn't already have one built in)
-- **Capacitive soil moisture sensor**: VCC → 3V3, GND → GND, AOUT → GPIO34
-- **FC-37 rain sensor**: VCC → 3V3, GND → GND, AOUT → GPIO35
+Open `circuit_diagram.svg` in a browser and wire exactly as shown:
 
-All grounds are common — connect every sensor's GND to the same ground rail
-as the ESP32.
+- **DHT22**: VCC → 3V3, GND → GND, DATA → GPIO4 (add a 10kΩ pull-up
+  resistor between DATA and VCC only if your module doesn't already have
+  one built into its breakout board)
+- **FC-28** (via its LM393 comparator board): VCC → 3V3, GND → GND, **A0** → GPIO34
+  — the probe itself just plugs into the 2-pin header on the comparator board
+- **MH-RD** (via its LM393 comparator board): VCC → 3V3, GND → GND, **A0** → GPIO35
+  — same pattern, plate plugs into the comparator board
+- **LM393 LDR module**: VCC → 3V3, GND → GND, **A0** → GPIO32
 
-## Step 2 — Install Arduino IDE support for ESP32
+Important: on all three comparator boards, you're wiring **A0** (analog
+output), not **D0**. D0 is a fixed digital trigger set by the onboard blue
+potentiometer — this project reads the raw analog value instead, since that
+gives an actual index rather than a single on/off threshold baked into the
+hardware.
 
-1. Open Arduino IDE → **File → Preferences** → in "Additional Board Manager
-   URLs" add:
+All grounds are common — every sensor's GND goes to the same ground rail as
+the ESP32.
+
+### Step 2 — Install Arduino IDE support for ESP32
+
+1. Arduino IDE → **File → Preferences** → Additional Board Manager URLs, add:
    `https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json`
-2. Go to **Tools → Board → Boards Manager**, search "esp32", install the
+2. **Tools → Board → Boards Manager** → search "esp32" → install the
    package by Espressif Systems.
 3. Select **Tools → Board → ESP32 Dev Module**.
-4. Select the correct **Port** once your board is plugged in via USB.
+4. Plug in your board via USB, select the correct **Port**.
 
-## Step 3 — Install required libraries
+### Step 3 — Install required libraries
 
-In Arduino IDE, go to **Sketch → Include Library → Manage Libraries** and
-install:
-- **DHT sensor library** (by Adafruit)
+**Sketch → Include Library → Manage Libraries**, install:
+- **DHT sensor library** (Adafruit)
 - **Adafruit Unified Sensor** (installs automatically as a dependency)
-- **ArduinoJson** (by Benoit Blanchon)
+- **ArduinoJson** (Benoit Blanchon)
 
-(BH1750 is no longer needed.)
+### Step 4 — Calibrate all three analog sensors in one pass
 
-## Step 4 — Calibrate the soil moisture sensor
+1. Open `analog_sensor_calibration.ino`, upload it to your ESP32.
+2. Open **Tools → Serial Monitor** at `115200` baud. You'll see three raw
+   values printed every second: `Soil raw`, `Rain raw`, `LDR raw`.
+3. **Soil (FC-28)**: hold the probe in dry air, note the value (→
+   `SOIL_ADC_DRY`). Submerge the probe tip fully in a glass of water, note
+   that value (→ `SOIL_ADC_WET`).
+4. **Rain (MH-RD)**: with the plate completely dry, note the value. Flick a
+   few drops of water onto the plate, note that value. Set
+   `RAIN_ADC_THRESHOLD` roughly halfway between the two.
+5. **LDR**: cover it fully (or turn off the room lights), note the value
+   (→ `LDR_ADC_DARK`). Shine a torch/phone flashlight directly on it, note
+   that value (→ `LDR_ADC_BRIGHT`).
 
-1. Open `soil_calibration.ino` in Arduino IDE, upload it to your ESP32.
-2. Open **Tools → Serial Monitor**, set baud rate to `115200`.
-3. Hold the sensor in dry air — note the number it prints. This is your
-   `SOIL_ADC_DRY` value.
-4. Submerge the sensor tip fully in a glass of water — note that number.
-   This is your `SOIL_ADC_WET` value.
-5. Open `config.h` (see Step 5) and set those two values.
+Skipping this step means all three readings will be meaningless — every
+individual sensor unit reads differently, especially the FC-28 and MH-RD
+comparator boards, which also have a manual sensitivity potentiometer that
+affects the raw analog range.
 
-This step matters — skipping it means your moisture index will be
-meaningless, since every sensor unit reads slightly differently. Also
-note: this gives you a **relative moisture index**, not a laboratory
-volumetric-water-content measurement — describe it that way in your pitch.
+### Step 5 — Create and fill in config.h
 
-## Step 5 — Create and fill in config.h
+1. Copy `config.example.h`, rename the copy to `config.h`.
+2. Fill in:
+   - `WIFI_SSID` / `WIFI_PASSWORD`
+   - `BACKEND_URL` (your deployed Render URL + `/sensor-data`)
+   - `DEVICE_ID` / `DEVICE_KEY` (must match your backend's `.env`)
+   - All five calibration values from Step 4
 
-1. Copy `config.example.h` and rename the copy to `config.h`.
-2. Open `config.h` and set:
-   - `WIFI_SSID` / `WIFI_PASSWORD` — your Wi-Fi hotspot credentials
-   - `BACKEND_URL` — your deployed Render URL with `/sensor-data` at the end
-   - `DEVICE_ID` — must match what your backend expects (default `FIELD-001`)
-   - `DEVICE_KEY` — must match `EXPECTED_DEVICE_KEY` in your backend's `.env`
-   - The calibrated `SOIL_ADC_DRY` / `SOIL_ADC_WET` values from Step 4
+`config.h` is gitignored — your real Wi-Fi password and device key never
+get committed.
 
-`config.h` is gitignored — it will never be committed, since it holds your
-real Wi-Fi password and device key.
+### Step 6 — Upload and test the main firmware
 
-## Step 6 — Upload and test the main firmware
-
-1. Open `crop_advisory_node.ino` in Arduino IDE (make sure `config.h` is in
-   the same folder — Arduino IDE will show both as tabs).
-2. Upload it to your ESP32.
+1. Open `crop_advisory_node.ino` (with `config.h` in the same folder —
+   Arduino IDE shows both as tabs).
+2. Upload to your ESP32.
 3. Open Serial Monitor at `115200` baud. You should see it connect to
-   Wi-Fi, then start printing sensor readings and confirming each POST to
-   your backend every 5 minutes (or your configured interval).
-4. Because of the backend's new state-change logic, you will **only** get a
-   real call/SMS when a condition is NEW or has cleared its cooldown — an
-   unchanged "still dry" reading every 5 minutes will NOT re-trigger a call.
-   This is intentional (see the main README's "What changed" section).
+   Wi-Fi, then print all four sensor readings and confirm each POST to
+   your backend on the configured interval.
+4. Because of the backend's state-change logic, an unchanged reading will
+   **not** re-trigger a call every cycle — this is intentional (see the
+   main `README.md`).
 
-## Testing tips
+## Demo sequence that shows the system actually thinking
 
-- **For faster demo testing**, temporarily lower `READING_INTERVAL_MS` in
-  `config.h` (e.g. to `30000` for 30 seconds), and lower
-  `ALERT_COOLDOWN_MINUTES` in the backend's `.env` (e.g. to `1`) so you can
-  see repeated alerts fire during development. Set both back to realistic
-  values (5 min / 720 min) before the actual showcase.
-- **To simulate different scenarios live**, physically dip the soil sensor
-  in water or pull it out into dry air — the moisture reading changes in
-  real time. A good demo sequence: show it dry (triggers a call), then show
-  it "still dry" a few minutes later (no second call — this proves the
-  anti-spam fix works), then unplug the DHT22 (triggers an honest sensor-
-  fault alert instead of fake data).
-- **Wi-Fi troubleshooting**: double-check the SSID/password have no typos,
-  and that you're on a 2.4GHz network — the ESP32 cannot connect to
-  5GHz-only Wi-Fi.
+1. **Action** — dip the FC-28 probe in water (or pull it into dry air) →
+   watch the dashboard update → phone rings.
+2. **No repeat spam** — leave it in the same state for the next cycle → no
+   second call, proving the anti-spam fix.
+3. **Failure handling** — unplug the DHT22 → dashboard shows an honest
+   sensor-fault alert instead of a fake reading.
+4. **Rain trigger** — flick a few drops of water onto the MH-RD plate →
+   `rain_detected_now` flips to true in the next reading.
+5. Mention the LDR reading on the dashboard as an example of a sensor that
+   was deliberately scoped as informational-only rather than forced into
+   the alert logic — a good answer if a judge asks "why doesn't light level
+   trigger anything?"
 
-## What was deliberately NOT built this week (and why)
+## Known limitations (state these once, don't over-apologize)
 
-- **Solar + battery power.** A 6V panel is not safely compatible with a
-  typical 5V-input TP4056 charger without additional regulation — that's a
-  real subsystem to design properly, not a one-week add-on. Use USB power
-  for the prototype and mention solar as future work.
-- **BH1750 / additional sensors.** Adding sensors the rule engine doesn't
-  actually use just adds wiring risk for zero functional benefit.
+- FC-28's exposed metal prongs corrode with prolonged soil contact —
+  expect calibration drift over weeks; a real deployment would either
+  recalibrate periodically or use a coated/capacitive probe instead.
+- The LM393 comparator boards' A0 range depends partly on the onboard
+  potentiometer's physical position — if you bump it, recalibrate.
+- Solar + battery power was deliberately not attempted this week — see the
+  main README's "what was NOT built" note.

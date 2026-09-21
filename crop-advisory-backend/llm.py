@@ -27,6 +27,7 @@ ALERT_CODE_DESCRIPTIONS = {
     "RAIN_WARNING": "Rain is forecast in the next few days, which may affect harvesting or field work.",
     "SENSOR_FAULT_DHT22": "The temperature and humidity sensor is not responding and should be checked.",
     "SENSOR_FAULT_SOIL": "The soil moisture sensor is not responding and should be checked.",
+    "WEATHER_UNAVAILABLE": "Weather forecast data is temporarily unavailable.",
 }
 
 SYSTEM_INSTRUCTION_TEXT = """You are a language renderer, not an advisor.

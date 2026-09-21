@@ -21,6 +21,7 @@ class SensorData(BaseModel):
     temperature: Optional[float] = Field(None, ge=-10, le=60)
     humidity: Optional[float] = Field(None, ge=0, le=100)
     raining: Optional[bool] = None
+    light_level: Optional[float] = Field(None, ge=0, le=100)  # LDR-derived ambient light index, informational only
 
     class Config:
         json_schema_extra = {
@@ -31,5 +32,6 @@ class SensorData(BaseModel):
                 "temperature": 29.5,
                 "humidity": 68.0,
                 "raining": False,
+                "light_level": 62.0,
             }
         }

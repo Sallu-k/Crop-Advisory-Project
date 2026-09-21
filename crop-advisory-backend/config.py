@@ -18,6 +18,20 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER", "")
 TWILIO_TO_NUMBER = os.getenv("TWILIO_TO_NUMBER", "")  # your verified personal number
 
+# Which SMS provider to actually use: "twilio" (default) or "textbee".
+# textbee (https://textbee.dev) turns an Android phone into the SMS sender
+# using its own SIM/carrier plan -- no trial-template restriction, no
+# per-message cost, no DLT registration needed for this kind of low-volume
+# personal/prototype use. Switching providers needs zero code changes.
+SMS_PROVIDER = os.getenv("SMS_PROVIDER", "twilio").lower()
+TEXTBEE_API_KEY = os.getenv("TEXTBEE_API_KEY", "")
+TEXTBEE_DEVICE_ID = os.getenv("TEXTBEE_DEVICE_ID", "")  # optional; blank uses your default registered device
+
+# The number that actually receives the advisory, regardless of provider.
+# Falls back to TWILIO_TO_NUMBER if not set separately, so your existing
+# .env keeps working with zero changes even if you only set that one.
+ADVISORY_TO_NUMBER = os.getenv("ADVISORY_TO_NUMBER", TWILIO_TO_NUMBER)
+
 # Voice + language for the phone call. Defaults to an English Indian voice.
 # For a Kannada demo, switch to a supported Google Kannada voice, e.g.:
 #   TWILIO_VOICE=Google.kn-IN-Standard-A
@@ -53,3 +67,10 @@ SOWING_DATE = os.getenv("SOWING_DATE", "2026-06-15")
 # even if it's still active. Prevents repeated calls every 5 minutes for an
 # unchanged condition. Set low (e.g. 1) only while actively testing.
 ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "720"))  # 12 hours default
+
+# Voice calling is fully implemented (see telephony.py + llm.py) but disabled
+# by default -- SMS alone is simpler to demo reliably and avoids voice/
+# language-quality risk on stage. Set to "true" to re-enable it; no code
+# changes needed. When disabled, the Gemini call for voice-message
+# generation is skipped entirely too, not just the phone call.
+ENABLE_VOICE_CALL = os.getenv("ENABLE_VOICE_CALL", "false").lower() == "true"

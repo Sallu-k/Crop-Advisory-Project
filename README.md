@@ -10,6 +10,28 @@ wiring/flow/block diagrams).
 > deployment. See `agronomy/AGRONOMY_SOURCES.md` for exactly which numbers
 > are sourced from where.
 
+> **Delivery mode:** SMS-only by default. Voice calling is fully implemented
+> and tested (`telephony.py` + `llm.py`) but disabled via a config flag
+> (`ENABLE_VOICE_CALL=false`) to reduce the number of moving parts to
+> rehearse for a live demo. This is a genuine implemented feature behind a
+> switch, not an unbuilt roadmap item — set `ENABLE_VOICE_CALL=true` in
+> `.env` to turn it back on with zero code changes. When disabled, the
+> Gemini call for voice-message generation is skipped entirely too.
+
+## SMS providers: Twilio trial vs. textbee
+
+Twilio trial accounts restrict SMS to predefined templates (error
+`572006`) and unverified recipients — real, documented limitations, not a
+bug in this code. Two ways around it:
+
+1. **Upgrade Twilio** (pay the small minimum, typically ~$20) — removes
+   both restrictions instantly, no other changes needed.
+2. **Switch to textbee** (free, no restrictions for this use case) — turns
+   an old Android phone into the SMS sender, using its own SIM/carrier
+   plan. Install the app, register at textbee.dev, get an API key, then in
+   `.env` set `SMS_PROVIDER=textbee` and `TEXTBEE_API_KEY=...`. No other
+   code changes — `telephony.py` routes to whichever provider is configured.
+
 ## What changed in v2 (responding to a full technical audit)
 
 The original v1 backend worked, but had a real spam bug and several
@@ -103,21 +125,23 @@ touches your real device's cooldown state:
 Try soil_moisture values across the hysteresis bands (below 28, 28–35,
 above 75), omit `temperature`/`humidity` to see sensor-fault handling, etc.
 
-## Step 6 — Confirm real delivery (uses Twilio quota — do sparingly)
+## Step 6 — Confirm real delivery (uses Twilio SMS quota — do sparingly)
 
 ```
 POST /sensor-data
 ```
 with header `X-Device-Key: <your EXPECTED_DEVICE_KEY>` and a real body.
 Because of the state-change logic, sending the **same** reading twice in a
-row will **not** trigger a second call — this is intentional, not a bug.
-To force a fresh demo call, either change the values enough to cross a
+row will **not** trigger a second SMS — this is intentional, not a bug.
+To force a fresh demo alert, either change the values enough to cross a
 threshold, or use:
 ```
 POST /demo/trigger
 ```
 (also requires the `X-Device-Key` header) — a fixed low-moisture scenario
-for a repeatable live demo.
+for a repeatable live demo. By default this sends SMS only (see the
+`ENABLE_VOICE_CALL` note above); it also places a voice call if you've
+turned that on.
 
 ## Step 7 — View the dashboard
 
@@ -146,7 +170,7 @@ one-week prototype — a real deployment would use a small persistent store
 
 - **401 Unauthorized on `/sensor-data`**: check that `X-Device-Key` matches
   `EXPECTED_DEVICE_KEY` exactly.
-- **No call/SMS on a repeated reading:** expected — see Step 6.
+- **No SMS on a repeated reading:** expected — see Step 6.
 - **Gemini call fails silently:** falls back to a deterministic template
   automatically — check logs for the reason, but delivery still proceeds.
 - **Mandi price shows unavailable:** either `DATA_GOV_API_KEY` isn't set, or
@@ -157,15 +181,22 @@ one-week prototype — a real deployment would use a small persistent store
 
 Don't say "Gemini analyzes the field and tells the farmer what to do." Say:
 "The agricultural decision is produced by deterministic, versioned rules
-(`rule_version` is returned with every response). Gemini is used only to
-turn that already-decided alert into a short, natural spoken message — it
-never sees a single raw number, so it structurally cannot invent one. If
-Gemini fails, the system falls back to a plain template automatically."
+(`rule_version` is returned with every response). SMS delivery uses a fully
+deterministic template — no LLM involved at all, so nothing about the
+numbers a farmer sees can be hallucinated. Voice calling is also fully
+built, using Gemini purely as a language-rendering layer that never sees a
+raw number — it's switched off for today's demo to keep the moving parts
+manageable, not because it doesn't work."
 
 A strong live demo sequence:
 1. **Action** — dip the soil sensor in water/dry it out → watch the
-   dashboard change → phone rings.
+   dashboard change → SMS arrives.
 2. **No-action** — same dry reading again a few minutes later → dashboard
-   updates, but no second call (the anti-spam fix, visibly proven).
+   updates, but no second SMS (the anti-spam fix, visibly proven).
 3. **Failure handling** — unplug the DHT22 → dashboard shows a sensor-fault
    alert instead of a fake reading.
+
+If a judge asks "why no voice call today?": "Voice is implemented and
+tested — see `ENABLE_VOICE_CALL` in the config — we scoped it off for this
+demo specifically to keep the number of live external dependencies low and
+reliable on stage, not because it's unbuilt."

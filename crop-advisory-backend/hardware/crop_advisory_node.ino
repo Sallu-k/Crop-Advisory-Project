@@ -1,32 +1,25 @@
-// crop_advisory_node.ino  (v2)
+// crop_advisory_node.ino  (v3 -- matches actual hardware)
 //
 // ESP32 field sensor node for the Voice-First Crop Advisory project.
+// Hardware: ESP32-WROOM-32 DevKit, DHT22, FC-28 soil moisture (with LM393
+// comparator board), MH-RD rain plate (with LM393 comparator board), LM393
+// LDR ambient-light module.
 //
-// What changed from v1, and why:
-//  - No NTP time sync. The ESP32 no longer computes days-since-sowing --
-//    that's now done on the BACKEND from a configured sowing date. This
-//    removes an entire failure mode (a bad/missing NTP sync used to
-//    silently produce days_since_sowing = 0, which could wrongly trigger a
-//    basal-fertilizer alert on a 90-day-old crop). The node now knows
-//    almost nothing about farming -- it just reports raw sensor readings.
-//  - DHT22 failure sends NULL for temperature/humidity instead of a fake
-//    plausible-looking number. A missing key in the JSON = sensor fault,
-//    handled honestly by the backend, not hidden.
-//  - Sends device_id + an incrementing sequence number, so the backend can
-//    reject duplicate/retried sends.
-//  - Sends the rain sensor reading (previously read but never transmitted).
-//  - Soil moisture is smoothed by averaging 16 readings, so the number
-//    doesn't jitter around on stage.
-//  - BH1750 light sensor removed -- unused in the current advisory logic,
-//    so it was just visual/wiring noise.
-//  - Sends a device-key header so random requests can't trigger a real call.
+// Design principles carried over from v2 (see hardware/README.md for the
+// full reasoning):
+//  - No NTP time sync -- days-since-sowing is computed on the BACKEND.
+//  - DHT22 failure sends NULL for temperature/humidity, never a fake value.
+//  - Soil moisture is a smoothed, calibrated INDEX, not a lab measurement.
+//  - device_id + sequence number sent so the backend can reject duplicates.
+//  - Ambient light (LDR) is sent as a purely informational field -- it
+//    never gates an alert and is never seen by the LLM.
 //
 // Required libraries (install via Arduino IDE Library Manager):
 //   - "DHT sensor library" by Adafruit
 //   - "Adafruit Unified Sensor" (dependency of the above)
 //   - "ArduinoJson" by Benoit Blanchon
 //
-// Board: any ESP32 DevKit (select "ESP32 Dev Module" in Tools > Board)
+// Board: ESP32 DevKit (select "ESP32 Dev Module" in Tools > Board)
 
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -37,9 +30,6 @@
 
 DHT dht(DHT_PIN, DHT_TYPE);
 
-// Persists only for as long as the device stays powered on. Resets to 0 on
-// reboot -- for a single-device one-week demo this is an accepted
-// simplification (see state_manager.py comments on the backend side).
 unsigned long sequenceNumber = 0;
 
 // ---------- Wi-Fi connection ----------
@@ -63,34 +53,51 @@ bool connectWiFi() {
   return false;
 }
 
-// ---------- Read soil moisture (averaged, smoothed) and convert to 0-100 index ----------
-// NOTE: this is a relative INDEX derived from calibration, not a laboratory
-// volumetric-water-content measurement. Present it as such.
-float readSoilMoistureIndex() {
-  const int samples = 16;
+// ---------- Averaged analog read helper (reduces jitter on stage) ----------
+long readAveraged(int pin, int samples = 16) {
   long total = 0;
   for (int i = 0; i < samples; i++) {
-    total += analogRead(SOIL_PIN);
+    total += analogRead(pin);
     delay(10);
   }
-  float raw = total / (float)samples;
+  return total / samples;
+}
 
-  // For capacitive sensors, a LOWER raw value usually means WETTER soil.
+// ---------- FC-28 soil moisture -> 0-100 index ----------
+// NOTE: this is a relative INDEX from calibration, not a laboratory
+// volumetric-water-content measurement. FC-28 uses exposed metal prongs
+// (resistive sensing) which corrode with prolonged soil contact -- expect
+// drift over weeks and recalibrate periodically.
+float readSoilMoistureIndex() {
+  long raw = readAveraged(SOIL_PIN);
+  // Lower raw value = wetter soil, for this sensor family.
   float index = 100.0 * ((float)(SOIL_ADC_DRY - raw) / (float)(SOIL_ADC_DRY - SOIL_ADC_WET));
   if (index < 0) index = 0;
   if (index > 100) index = 100;
   return index;
 }
 
-// ---------- Read rain sensor (lower analog reading = more water detected) ----------
+// ---------- MH-RD rain plate: lower raw = more water detected ----------
 bool readIsRaining() {
-  int raw = analogRead(RAIN_PIN);
-  // Starting threshold -- tune based on your specific module's dry/wet readings.
-  return raw < 2000;
+  long raw = readAveraged(RAIN_PIN, 8);
+  return raw < RAIN_ADC_THRESHOLD;
+}
+
+// ---------- LM393 LDR -> 0-100 ambient light index (informational only) ----------
+float readLightLevel() {
+  long raw = readAveraged(LDR_PIN, 8);
+  // Lower raw value = brighter, for this sensor family (LM393 comparator boards
+  // typically output higher voltage/ADC in darkness). Calibrate and confirm
+  // the direction on YOUR module with analog_sensor_calibration.ino.
+  float index = 100.0 * ((float)(LDR_ADC_DARK - raw) / (float)(LDR_ADC_DARK - LDR_ADC_BRIGHT));
+  if (index < 0) index = 0;
+  if (index > 100) index = 100;
+  return index;
 }
 
 // ---------- Send JSON payload to backend ----------
-bool sendSensorData(float soilMoisture, bool dhtOk, float temperature, float humidity, bool raining) {
+bool sendSensorData(float soilMoisture, bool dhtOk, float temperature, float humidity,
+                     bool raining, float lightLevel) {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi not connected, skipping send.");
     return false;
@@ -102,11 +109,12 @@ bool sendSensorData(float soilMoisture, bool dhtOk, float temperature, float hum
   http.addHeader("X-Device-Key", DEVICE_KEY);
   http.setTimeout(15000);
 
-  StaticJsonDocument<320> doc;
+  StaticJsonDocument<384> doc;
   doc["device_id"] = DEVICE_ID;
   doc["sequence"] = sequenceNumber;
   doc["soil_moisture"] = soilMoisture;
   doc["raining"] = raining;
+  doc["light_level"] = lightLevel;
 
   // Only include temperature/humidity if the DHT22 read succeeded --
   // otherwise leave them out entirely so the backend receives null,
@@ -139,7 +147,7 @@ bool sendSensorData(float soilMoisture, bool dhtOk, float temperature, float hum
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n=== Crop Advisory Field Node Starting (v2) ===");
+  Serial.println("\n=== Crop Advisory Field Node Starting (v3) ===");
 
   dht.begin();
   connectWiFi();
@@ -161,6 +169,7 @@ void loop() {
 
   float soilMoisture = readSoilMoistureIndex();
   bool raining = readIsRaining();
+  float lightLevel = readLightLevel();
 
   Serial.println("---- Readings ----");
   Serial.printf("Soil moisture index: %.1f / 100\n", soilMoisture);
@@ -171,9 +180,10 @@ void loop() {
     Serial.println("Temperature/Humidity: FAULT (DHT22 not responding)");
   }
   Serial.printf("Raining now: %s\n", raining ? "yes" : "no");
+  Serial.printf("Ambient light index: %.1f / 100\n", lightLevel);
   Serial.printf("Sequence: %lu\n", sequenceNumber);
 
-  bool sent = sendSensorData(soilMoisture, dhtOk, temperature, humidity, raining);
+  bool sent = sendSensorData(soilMoisture, dhtOk, temperature, humidity, raining, lightLevel);
   Serial.println(sent ? "Data sent successfully." : "Data send failed (will retry with a fresh reading next cycle).");
 
   sequenceNumber++;

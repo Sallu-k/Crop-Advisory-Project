@@ -26,23 +26,40 @@
 #define DEVICE_KEY      "demo-key-123"
 
 // ---- Pin assignments (match hardware/circuit_diagram.svg) ----
-// Note: BH1750 light sensor has been removed -- three well-integrated
-// sensors (moisture, temp/humidity, rain) beat four half-integrated ones.
+// Your actual hardware: DHT22, FC-28 soil moisture (via LM393 comparator
+// board), MH-RD rain plate (via LM393 comparator board), LM393 LDR module.
 #define DHT_PIN         4      // DHT22 data pin
 #define DHT_TYPE        DHT22
-#define SOIL_PIN        34     // Capacitive soil moisture analog output (ADC1_6)
-#define RAIN_PIN        35     // FC-37 rain sensor analog output (ADC1_7)
+#define SOIL_PIN        34     // FC-28 comparator board AOUT (ADC1_6)
+#define RAIN_PIN        35     // MH-RD comparator board AOUT (ADC1_7)
+#define LDR_PIN         32     // LM393 LDR module AOUT (ADC1_4)
 
 // ---- Reading interval ----
 #define READING_INTERVAL_MS   (5UL * 60UL * 1000UL)   // 5 minutes; lower this for live demo testing
 
-// ---- Soil moisture calibration ----
+// ---- FC-28 soil moisture calibration ----
 // Raw ADC values from YOUR sensor in fully dry air vs. fully in water.
-// Run soil_calibration.ino FIRST to find these for your specific sensor
-// unit, then update the values below. This is a relative INDEX, not a
-// laboratory volumetric-water-content measurement -- call it that in your
-// pitch, not "soil moisture percentage".
+// Run analog_sensor_calibration.ino FIRST to find these for your specific
+// sensor unit, then update the values below. This is a relative INDEX, not
+// a laboratory volumetric-water-content measurement -- call it that in
+// your pitch, not "soil moisture percentage".
+// NOTE: FC-28 uses two exposed metal prongs (resistive sensing), which
+// corrode with prolonged soil contact -- expect drift over weeks and plan
+// to recalibrate periodically, or note this as a known limitation.
 #define SOIL_ADC_DRY    3000   // raw analogRead() value in dry air (placeholder -- recalibrate!)
 #define SOIL_ADC_WET    1200   // raw analogRead() value fully submerged in water (placeholder -- recalibrate!)
+
+// ---- MH-RD rain plate threshold ----
+// Lower raw reading = more water detected on the plate. Find your own
+// dry-plate baseline with analog_sensor_calibration.ino and set the
+// threshold roughly halfway between dry and a few water drops on the plate.
+#define RAIN_ADC_THRESHOLD   2000   // placeholder -- recalibrate!
+
+// ---- LM393 LDR calibration ----
+// Raw ADC values in full darkness (covered) vs. bright light (torch/sun).
+// Used only to compute an informational ambient-light index -- this never
+// gates an alert or reaches the LLM.
+#define LDR_ADC_DARK    3200   // placeholder -- recalibrate!
+#define LDR_ADC_BRIGHT  600    // placeholder -- recalibrate!
 
 #endif

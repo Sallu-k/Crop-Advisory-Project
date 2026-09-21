@@ -21,7 +21,7 @@ from message_planner import build_voice_message, build_sms_message
 from telephony import send_sms, make_voice_call
 from dashboard import render_dashboard
 import state_manager
-from config import EXPECTED_DEVICE_KEY, SOWING_DATE
+from config import EXPECTED_DEVICE_KEY, SOWING_DATE, ENABLE_VOICE_CALL
 
 app = FastAPI(title="Crop Advisory Backend v2")
 
@@ -55,6 +55,7 @@ def run_pipeline(data: SensorData, deliver: bool, is_preview: bool = False) -> d
         temperature=data.temperature,
         humidity=data.humidity,
         raining=data.raining,
+        light_level=data.light_level,
         days_since_sowing=days_since_sowing,
         previous_moisture_state=previous_moisture_state,
     )
@@ -76,6 +77,7 @@ def run_pipeline(data: SensorData, deliver: bool, is_preview: bool = False) -> d
             "temperature_c": data.temperature,
             "humidity_percent": data.humidity,
             "rain_detected_now": data.raining,
+            "light_level": data.light_level,
         },
         "days_since_sowing": days_since_sowing,
         "current_alert_codes": result["alert_codes"],
@@ -85,7 +87,12 @@ def run_pipeline(data: SensorData, deliver: bool, is_preview: bool = False) -> d
     if not new_alerts:
         response["action_taken"] = "none (no new or renewed alert conditions)"
         if not is_preview:
-            state_manager.save_snapshot(device_id, {"facts": result["facts"], "alert_codes": result["alert_codes"]})
+            # Weather/mandi were deliberately not fetched on this reading, so
+            # flag it -- the dashboard must not present "not checked" as "unavailable".
+            state_manager.save_snapshot(device_id, {
+                "facts": {**result["facts"], "weather_checked": False},
+                "alert_codes": result["alert_codes"],
+            })
         return response
 
     # ---- Only now (something to say) do we fetch external context ----
@@ -97,6 +104,7 @@ def run_pipeline(data: SensorData, deliver: bool, is_preview: bool = False) -> d
         temperature=data.temperature,
         humidity=data.humidity,
         raining=data.raining,
+        light_level=data.light_level,
         days_since_sowing=days_since_sowing,
         previous_moisture_state=previous_moisture_state,
         weather=weather,
@@ -104,7 +112,10 @@ def run_pipeline(data: SensorData, deliver: bool, is_preview: bool = False) -> d
     )
     facts = result_with_context["facts"]
 
-    voice_message = build_voice_message(new_alerts)
+    # Voice message generation (and the Gemini call it needs) is skipped
+    # entirely when voice calling is disabled -- SMS-only mode has one
+    # fewer external dependency to worry about.
+    voice_message = build_voice_message(new_alerts) if ENABLE_VOICE_CALL else None
     sms_message = build_sms_message(result_with_context["alert_codes"], facts)
 
     response["facts"] = facts
@@ -113,15 +124,19 @@ def run_pipeline(data: SensorData, deliver: bool, is_preview: bool = False) -> d
 
     if deliver:
         sms_result = send_sms(sms_message)
-        call_result = make_voice_call(voice_message)
+        if ENABLE_VOICE_CALL:
+            call_result = make_voice_call(voice_message)
+            voice_status = "sent" if call_result.get("success") else f"failed: {call_result.get('error', call_result.get('status_code'))}"
+        else:
+            voice_status = "disabled (SMS-only mode)"
         response["delivery"] = {
-            "voice_status": "sent" if call_result.get("success") else f"failed: {call_result.get('error', call_result.get('status_code'))}",
+            "voice_status": voice_status,
             "sms_status": "sent" if sms_result.get("success") else f"failed: {sms_result.get('error', sms_result.get('status_code'))}",
         }
 
     if not is_preview:
         state_manager.save_snapshot(device_id, {
-            "facts": facts,
+            "facts": {**facts, "weather_checked": True},
             "alert_codes": result_with_context["alert_codes"],
             "delivery": response.get("delivery"),
         })
@@ -170,5 +185,5 @@ def demo_trigger(x_device_key: str = Header(default=None)):
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    return render_dashboard()
+def dashboard(device: str = None):
+    return render_dashboard(device)

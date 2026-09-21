@@ -26,10 +26,14 @@ def build_sms_message(alert_codes: list, facts: dict) -> str:
         lines.append(f"Temperature: {facts['temperature_c']:.1f}C")
     if facts.get("humidity_percent") is not None:
         lines.append(f"Humidity: {facts['humidity_percent']:.0f}%")
+    if facts.get("light_level") is not None:
+        lines.append(f"Ambient light index: {facts['light_level']:.0f}/100")
 
     lines.append("")
     lines.append("Alerts:")
     for code in alert_codes:
+        if code == "WEATHER_UNAVAILABLE":
+            continue  # already covered by the dedicated weather section below
         lines.append(f"- {ALERT_CODE_DESCRIPTIONS.get(code, code)}")
 
     weather_available = facts.get("weather_available")

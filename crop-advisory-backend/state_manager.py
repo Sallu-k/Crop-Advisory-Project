@@ -113,7 +113,23 @@ def get_new_alerts(device_id: str, current_codes: list) -> list:
 
 
 def save_snapshot(device_id: str, snapshot: dict):
-    get_device_state(device_id)["last_snapshot"] = snapshot
+    """
+    Stores the latest snapshot for the dashboard, stamped with the time it was
+    received. A reading that sent nothing (no new alert) keeps showing the last
+    delivery result, instead of the dashboard forgetting it on the very next
+    healthy reading.
+    """
+    state = get_device_state(device_id)
+    now = datetime.now().isoformat()
+    snapshot = {**snapshot, "updated_at": now}
+    if snapshot.get("delivery"):
+        snapshot["delivery_at"] = now
+    else:
+        previous = state["last_snapshot"] or {}
+        if previous.get("delivery"):
+            snapshot["delivery"] = previous["delivery"]
+            snapshot["delivery_at"] = previous.get("delivery_at")
+    state["last_snapshot"] = snapshot
 
 
 def get_snapshot(device_id: str):
