@@ -8,8 +8,10 @@ into the SMS via a separate deterministic template (see message_planner.py),
 never through the LLM.
 """
 import json
+import re
 import requests
 from config import GEMINI_API_KEY
+from http_errors import describe_error
 
 GEMINI_URL = (
     "https://generativelanguage.googleapis.com/v1beta/models/"
@@ -75,17 +77,26 @@ def generate_voice_message(alert_codes: list, language_note: str = "English") ->
             ],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 250},
         }
+        # The key goes in a header, not the URL, so it can never end up in a logged URL.
         response = requests.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            GEMINI_URL,
             json=payload,
+            headers={"x-goog-api-key": GEMINI_API_KEY},
             timeout=15,
         )
         response.raise_for_status()
         data = response.json()
         message = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if not message:
+            raise ValueError("empty model response")
+        # The model is never GIVEN a number, but nothing stops it from inventing one.
+        # The spoken message must not contain any figure the rules didn't produce, so
+        # a reply with digits is rejected in favour of the deterministic template.
+        if any(ch.isdigit() for ch in message):
+            raise ValueError("model reply contained digits")
         return message
     except Exception as e:
-        print(f"[llm.py] Gemini call failed, using fallback template: {e}")
+        print(f"[llm.py] Gemini call failed, using fallback template: {describe_error(e)}")
         return _fallback_voice_message(descriptions)
 
 
@@ -97,3 +108,59 @@ def _fallback_voice_message(descriptions: list) -> str:
     body = " ".join(descriptions)
     outro = " Thank you."
     return intro + body + outro
+
+
+LANGUAGE_NAMES = {
+    "kn": "Kannada", "hi": "Hindi", "te": "Telugu", "ta": "Tamil",
+    "mr": "Marathi", "en": "English",
+}
+
+TRANSLATE_SYSTEM_INSTRUCTION = (
+    "You are a precise translator. Translate the given SMS text exactly as "
+    "written. Do not add, remove, explain, or summarise anything. Keep every "
+    "number, date, and price exactly as it appears in the original."
+)
+
+
+def translate_sms_message(text: str, target_lang_code: str) -> str:
+    """
+    Translates an ALREADY-FINALIZED, fully deterministic SMS into another
+    language -- this is translation only, never generation, so it cannot add
+    a new fact. As an extra safety check: every run of digits in the English
+    original (moisture index, temperature, prices, rule version) must appear
+    unchanged in the translation, or the translation is discarded and the
+    English original is sent instead. A mistranslated word is a readability
+    problem; a silently altered number is a trust problem, so numbers are
+    never left to the model's judgement.
+    """
+    if not target_lang_code or target_lang_code == "en":
+        return text
+
+    language_name = LANGUAGE_NAMES.get(target_lang_code, target_lang_code)
+    try:
+        payload = {
+            "systemInstruction": {"parts": [{"text": TRANSLATE_SYSTEM_INSTRUCTION}]},
+            "contents": [{"parts": [{"text": f"Translate this SMS into {language_name}:\n\n{text}"}]}],
+            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 400},
+        }
+        response = requests.post(
+            GEMINI_URL,
+            json=payload,
+            headers={"x-goog-api-key": GEMINI_API_KEY},
+            timeout=15,
+        )
+        response.raise_for_status()
+        data = response.json()
+        translated = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        if not translated:
+            raise ValueError("empty translation")
+
+        original_numbers = re.findall(r"\d+(?:\.\d+)?", text)
+        missing = [n for n in original_numbers if n not in translated]
+        if missing:
+            raise ValueError(f"translation dropped or altered number(s): {missing}")
+
+        return translated
+    except Exception as e:
+        print(f"[llm.py] SMS translation to {target_lang_code} failed, sending English original: {describe_error(e)}")
+        return text

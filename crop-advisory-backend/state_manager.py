@@ -18,9 +18,22 @@ call/SMS only when they're new or the cooldown has expired). Everything else
 whenever an actionable alert is already being sent -- it never triggers a
 notification by itself.
 """
+import threading
 from datetime import datetime, timedelta
 
-from config import ALERT_COOLDOWN_MINUTES
+from config import ALERT_COOLDOWN_MINUTES, TIME_BASED_ALERT_COOLDOWN_MINUTES, TRANSLATE_SMS_TO
+import sms_i18n
+
+# The endpoints are plain `def` functions, which FastAPI runs in a thread pool, so
+# every read-modify-write on the store below happens under this lock.
+_LOCK = threading.RLock()
+
+# The ESP32 keeps its sequence counter in RAM, so after a power cycle it starts
+# again from 0. A reading that is "not newer" is normally a retry/duplicate, but a
+# sequence of 0 (after readings were already seen) or one far below the last seen
+# value means the device restarted -- ignoring it would silence the device until
+# its counter caught up with the old value (hours, at a 5-minute interval).
+REBOOT_SEQUENCE_DROP = 10
 
 ACTIONABLE_CODES = {
     "LOW_MOISTURE",
@@ -35,6 +48,18 @@ ACTIONABLE_CODES = {
     "SENSOR_FAULT_SOIL",
 }
 
+# Calendar-driven reminders: they depend only on the crop's age, so they stay true for
+# days (HARVEST_CHECK_DUE stays true for good). They repeat on the long
+# TIME_BASED_ALERT_COOLDOWN_MINUTES instead of the short ALERT_COOLDOWN_MINUTES that
+# suits live sensor conditions -- see config.py.
+TIME_BASED_CODES = {
+    "FERTILIZER_DUE_BASAL",
+    "FERTILIZER_DUE_TILLERING",
+    "FERTILIZER_DUE_PANICLE",
+    "HARVEST_APPROACHING",
+    "HARVEST_CHECK_DUE",
+}
+
 # device_id -> {
 #     "moisture_state": "low"/"normal"/"high"/None,
 #     "active_codes": set(),
@@ -43,6 +68,53 @@ ACTIONABLE_CODES = {
 #     "last_snapshot": dict,   # for the dashboard
 # }
 _STATE_STORE = {}
+
+# Process-wide (not per-device) runtime state, same in-memory lifetime as the store above:
+#   sms_language   -- set from the dashboard; None means "use the .env default"
+#   last_sms_event -- outcome of the most recent SMS attempt (any device), for the dashboard banner
+_RUNTIME = {"sms_language": None, "last_sms_event": None}
+
+
+def get_sms_language() -> str:
+    """Language for every SMS: the dashboard choice if one was made, else TRANSLATE_SMS_TO, else English."""
+    with _LOCK:
+        return _RUNTIME["sms_language"] or sms_i18n.normalize_language(TRANSLATE_SMS_TO)
+
+
+def set_sms_language(lang: str):
+    with _LOCK:
+        _RUNTIME["sms_language"] = sms_i18n.normalize_language(lang)
+
+
+def record_sms_event(event: dict):
+    """Remember the outcome (sent or failed) of the latest SMS attempt so the dashboard can confirm it."""
+    with _LOCK:
+        _RUNTIME["last_sms_event"] = dict(event)
+
+
+def get_last_sms_event():
+    with _LOCK:
+        event = _RUNTIME["last_sms_event"]
+        return dict(event) if event else None
+
+
+def clear_simulation():
+    """
+    "Back to real values": forget every simulated (DEMO*) device, and the last-SMS notice if it
+    was for a simulated problem. Real devices, their alert state and the language are untouched.
+    """
+    with _LOCK:
+        for device_id in [d for d in _STATE_STORE if d.startswith("DEMO")]:
+            _STATE_STORE.pop(device_id, None)
+        event = _RUNTIME["last_sms_event"]
+        if event and event.get("simulated"):
+            _RUNTIME["last_sms_event"] = None
+
+
+def reset_runtime():
+    """Forget the dashboard language choice and the last SMS event (used by tests)."""
+    with _LOCK:
+        _RUNTIME.update(sms_language=None, last_sms_event=None)
 
 
 def get_device_state(device_id: str) -> dict:
@@ -59,19 +131,31 @@ def get_device_state(device_id: str) -> dict:
 
 def is_duplicate_sequence(device_id: str, sequence: int) -> bool:
     """
-    A retried/duplicate ESP32 send has the same (or lower) sequence number
-    as one already processed. Reject it so it can't double-trigger an alert.
-    Note: a device reboot resets its own sequence counter to 0, which would
-    look like a big drop -- for a one-week single-device demo this is an
-    accepted simplification; a real deployment would pair sequence with a
-    boot ID.
+    A retried/duplicate send has the same (or slightly lower) sequence number as
+    one already processed. Reject it so it can't double-trigger an alert.
+
+    A device restart is NOT a duplicate: see REBOOT_SEQUENCE_DROP above.
     """
-    state = get_device_state(device_id)
-    return sequence <= state["last_sequence"]
+    with _LOCK:
+        last = get_device_state(device_id)["last_sequence"]
+        if sequence > last:
+            return False
+        restarted = (sequence == 0 and last > 0) or (last - sequence > REBOOT_SEQUENCE_DROP)
+        return not restarted
 
 
 def record_sequence(device_id: str, sequence: int):
-    get_device_state(device_id)["last_sequence"] = sequence
+    with _LOCK:
+        get_device_state(device_id)["last_sequence"] = sequence
+
+
+def accept_sequence(device_id: str, sequence: int) -> bool:
+    """Atomic check-and-record. True if the reading is new and should be processed."""
+    with _LOCK:
+        if is_duplicate_sequence(device_id, sequence):
+            return False
+        record_sequence(device_id, sequence)
+        return True
 
 
 def get_previous_moisture_state(device_id: str):
@@ -88,53 +172,87 @@ def get_new_alerts(device_id: str, current_codes: list) -> list:
     Returns only the codes that should ACTUALLY trigger a new notification
     right now, and updates the stored state to reflect this call.
     """
-    state = get_device_state(device_id)
-    now = datetime.now()
-    cooldown = timedelta(minutes=ALERT_COOLDOWN_MINUTES)
+    with _LOCK:
+        state = get_device_state(device_id)
+        now = datetime.now()
+        live_cooldown = timedelta(minutes=ALERT_COOLDOWN_MINUTES)
+        calendar_cooldown = timedelta(minutes=TIME_BASED_ALERT_COOLDOWN_MINUTES)
 
-    current_actionable = set(c for c in current_codes if c in ACTIONABLE_CODES)
-    new_alerts = []
+        current_actionable = set(c for c in current_codes if c in ACTIONABLE_CODES)
+        new_alerts = []
 
-    for code in current_actionable:
-        was_active = code in state["active_codes"]
-        last_sent_time = state["last_sent"].get(code)
-        cooldown_expired = (last_sent_time is None) or (now - last_sent_time >= cooldown)
+        for code in current_actionable:
+            cooldown = calendar_cooldown if code in TIME_BASED_CODES else live_cooldown
+            was_active = code in state["active_codes"]
+            last_sent_time = state["last_sent"].get(code)
+            cooldown_expired = (last_sent_time is None) or (now - last_sent_time >= cooldown)
 
-        if (not was_active) or cooldown_expired:
-            new_alerts.append(code)
-            state["last_sent"][code] = now
+            if (not was_active) or cooldown_expired:
+                new_alerts.append(code)
+                state["last_sent"][code] = now
 
-    # A code that WAS active but no longer is just gets dropped silently
-    # (e.g. moisture went from low back to normal -- no "all clear" call,
-    # to avoid doubling the number of notifications for no real benefit).
-    state["active_codes"] = current_actionable
+        # A code that WAS active but no longer is just gets dropped silently
+        # (e.g. moisture went from low back to normal -- no "all clear" call,
+        # to avoid doubling the number of notifications for no real benefit).
+        state["active_codes"] = current_actionable
 
-    return sorted(new_alerts)
+        return sorted(new_alerts)
+
+
+def rollback_alerts(device_id: str, codes: list):
+    """
+    Undo get_new_alerts() for these codes. Called when delivery FAILED on every
+    channel: the farmer was never told, so the cooldown must not start -- the
+    codes count as brand new again and are retried on the next reading.
+    """
+    with _LOCK:
+        state = get_device_state(device_id)
+        for code in codes:
+            state["last_sent"].pop(code, None)
+            state["active_codes"].discard(code)
 
 
 def save_snapshot(device_id: str, snapshot: dict):
     """
-    Stores the latest snapshot for the dashboard, stamped with the time it was
-    received. A reading that sent nothing (no new alert) keeps showing the last
-    delivery result, instead of the dashboard forgetting it on the very next
-    healthy reading.
+    Stores the dashboard snapshot, stamped with `updated_at`. The most recent
+    delivery result is kept (with `delivery_at`) until a newer one replaces it, so
+    the dashboard doesn't forget what was last sent just because the next reading
+    had nothing new to say.
     """
-    state = get_device_state(device_id)
-    now = datetime.now().isoformat()
-    snapshot = {**snapshot, "updated_at": now}
-    if snapshot.get("delivery"):
-        snapshot["delivery_at"] = now
-    else:
-        previous = state["last_snapshot"] or {}
-        if previous.get("delivery"):
-            snapshot["delivery"] = previous["delivery"]
-            snapshot["delivery_at"] = previous.get("delivery_at")
-    state["last_snapshot"] = snapshot
+    with _LOCK:
+        state = get_device_state(device_id)
+        previous = state.get("last_snapshot") or {}
+        now = datetime.now().isoformat()
+
+        snap = dict(snapshot)
+        snap["updated_at"] = now
+        if snap.get("delivery"):
+            snap["delivery_at"] = now
+        elif previous.get("delivery"):
+            snap["delivery"] = previous["delivery"]
+            snap["delivery_at"] = previous.get("delivery_at")
+        state["last_snapshot"] = snap
 
 
 def get_snapshot(device_id: str):
-    return get_device_state(device_id).get("last_snapshot")
+    """Read-only lookup: unlike get_device_state it never creates state for an unknown id."""
+    with _LOCK:
+        state = _STATE_STORE.get(device_id)
+        return state.get("last_snapshot") if state else None
 
 
 def get_all_device_ids():
-    return list(_STATE_STORE.keys())
+    with _LOCK:
+        return list(_STATE_STORE.keys())
+
+
+def get_dashboard_device_ids():
+    """Devices that have actually produced a reading (i.e. have a snapshot to show)."""
+    with _LOCK:
+        return [d for d, st in _STATE_STORE.items() if st.get("last_snapshot")]
+
+
+def reset_device(device_id: str):
+    """Forget everything about one device (used to make /demo/trigger repeatable)."""
+    with _LOCK:
+        _STATE_STORE.pop(device_id, None)

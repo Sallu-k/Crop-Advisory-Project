@@ -11,6 +11,7 @@ shared public key baked into source code.
 """
 import requests
 from config import DATA_GOV_API_KEY, MANDI_STATE, MANDI_DISTRICT, MANDI_COMMODITY
+from http_errors import describe_error
 
 MANDI_API_URL = "https://api.data.gov.in/resource/9ef84268-d588-465a-a308-a864a43d0070"
 
@@ -38,7 +39,7 @@ def get_mandi_price() -> dict:
             "filters[district]": MANDI_DISTRICT,
             "filters[commodity]": MANDI_COMMODITY,
         }
-        response = requests.get(MANDI_API_URL, params=params, timeout=10)
+        response = requests.get(MANDI_API_URL, params=params, timeout=5)
         response.raise_for_status()
         data = response.json()
         records = data.get("records", [])
@@ -61,5 +62,5 @@ def get_mandi_price() -> dict:
             "modal_price": float(modal_price),
         }
     except Exception as e:
-        print(f"[mandi.py] Mandi price API call failed: {e}")
+        print(f"[mandi.py] Mandi price API call failed: {describe_error(e)}")
         return {"available": False}

@@ -9,22 +9,12 @@ missing value is handled (it raises a SENSOR_FAULT alert code, it does not
 get silently treated as fine).
 """
 from typing import Optional
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class SensorData(BaseModel):
-    device_id: str = Field(..., min_length=1, max_length=64)
-    sequence: int = Field(..., ge=0)
-
-    # Range limits reject obviously garbage readings before they reach any logic.
-    soil_moisture: Optional[float] = Field(None, ge=0, le=100)
-    temperature: Optional[float] = Field(None, ge=-10, le=60)
-    humidity: Optional[float] = Field(None, ge=0, le=100)
-    raining: Optional[bool] = None
-    light_level: Optional[float] = Field(None, ge=0, le=100)  # LDR-derived ambient light index, informational only
-
-    class Config:
-        json_schema_extra = {
+    model_config = ConfigDict(
+        json_schema_extra={
             "example": {
                 "device_id": "FIELD-001",
                 "sequence": 42,
@@ -35,3 +25,25 @@ class SensorData(BaseModel):
                 "light_level": 62.0,
             }
         }
+    )
+
+    device_id: str = Field(..., min_length=1, max_length=64)
+    # strict: a JSON `true` or a numeric string is not a sequence number.
+    # The upper bound is the largest value the ESP32's `unsigned long` can hold.
+    sequence: int = Field(..., strict=True, ge=0, le=4_294_967_295)
+
+    # Range limits reject obviously garbage readings before they reach any logic.
+    # NaN/Infinity are rejected explicitly (they are not valid JSON, but Python's parser accepts them).
+    soil_moisture: Optional[float] = Field(None, ge=0, le=100, allow_inf_nan=False)
+    temperature: Optional[float] = Field(None, ge=-10, le=60, allow_inf_nan=False)
+    humidity: Optional[float] = Field(None, ge=0, le=100, allow_inf_nan=False)
+    raining: Optional[bool] = None
+    light_level: Optional[float] = Field(None, ge=0, le=100, allow_inf_nan=False)  # LDR-derived ambient light index, informational only
+
+    @field_validator("device_id")
+    @classmethod
+    def _device_id_not_blank(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("device_id must not be blank")
+        return value

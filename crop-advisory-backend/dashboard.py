@@ -1,180 +1,162 @@
 """
-A single, dependency-free HTML dashboard -- no React, no build step, no
-auth. Just enough to visually show the system's current state during a
-demo. Reads directly from state_manager's in-memory snapshot store.
+A single, dependency-free HTML dashboard -- no JavaScript, no React, no build
+step. Just enough to show the system's current state during a demo. Reads
+directly from state_manager's in-memory snapshot store.
 
-Every value that ends up in the page is HTML-escaped: device_id comes from
-whatever the sensor (or anyone holding the device key) sends, so it must never
-be trusted as markup.
+Everything that originates outside this file (device ids, alert codes, delivery
+error text, mandi fields, dates) is HTML-escaped before it is placed in the page:
+device ids arrive from the network, so they are untrusted input.
 """
 from datetime import datetime
 from html import escape
 from urllib.parse import quote
 
 from agronomy.paddy_profile import (
+    CROP_PROFILE,
     FERTILIZER_RULES,
     HARVEST_APPROACHING_WINDOW_DAYS,
     MOISTURE_HIGH_ENTER,
     MOISTURE_LOW_ENTER,
 )
-from llm import ALERT_CODE_DESCRIPTIONS
-from state_manager import ACTIONABLE_CODES, get_all_device_ids, get_snapshot
+from config import LOCATION_NAME, STALE_AFTER_MINUTES   # STALE_AFTER_MINUTES: see config.py
+from state_manager import get_dashboard_device_ids, get_last_sms_event, get_snapshot, get_sms_language
+import demo_scenarios
+from sms_i18n import SUPPORTED_LANGUAGES
 from weather import RAIN_THRESHOLD_MM
 
-# The ESP32 reports every few minutes; three missed reports means something is wrong.
-STALE_AFTER_SECONDS = 15 * 60
 REFRESH_SECONDS = 15
 
-# Colour is never the only signal: every severity also has a text label.
-_SEVERITY_LABEL = {"bad": "Fault", "warn": "Warning", "info": "Action", "muted": "Note"}
-_SEVERITY_ORDER = {"bad": 0, "warn": 1, "info": 2, "muted": 3}
-_CODE_SEVERITY = {
-    "SENSOR_FAULT_DHT22": "bad",
-    "SENSOR_FAULT_SOIL": "bad",
-    "LOW_MOISTURE": "warn",
-    "EXCESS_MOISTURE": "warn",
-    "RAIN_WARNING": "warn",
-    "WEATHER_UNAVAILABLE": "muted",
+# code -> (severity, human-readable text). Severity: "bad" (a fault), "warn" (needs
+# the farmer), "wet" (too much water), "info" (context, not an action).
+ALERTS = {
+    "SENSOR_FAULT_DHT22": ("bad", "DHT22 sensor not responding. Check the temperature and humidity sensor."),
+    "SENSOR_FAULT_SOIL": ("bad", "The soil moisture sensor is not reporting. Check the probe and its wiring."),
+    "LOW_MOISTURE": ("warn", "The soil moisture is low. Check the field and irrigate if needed."),
+    "EXCESS_MOISTURE": ("wet", "The soil shows high moisture. Check for standing water and drainage."),
+    "FERTILIZER_DUE_BASAL": ("warn", "The basal fertilizer dose is due."),
+    "FERTILIZER_DUE_TILLERING": ("warn", "The first nitrogen top-dressing is due (tillering stage)."),
+    "FERTILIZER_DUE_PANICLE": ("warn", "The second nitrogen top-dressing is due (panicle initiation)."),
+    "HARVEST_APPROACHING": ("warn", "The crop is approaching its estimated harvest window."),
+    "HARVEST_CHECK_DUE": ("warn", "A harvest check is due. Inspect grain colour and moisture before deciding."),
+    "RAIN_WARNING": ("warn", "Rain is forecast, which may affect harvesting or field work."),
+    "WEATHER_UNAVAILABLE": ("info", "The weather forecast could not be fetched."),
 }
+_SEVERITY_ORDER = {"bad": 0, "warn": 1, "wet": 1, "info": 2}
 
-_CSS = """
-:root{
-  --bg:#0c1917;--card:#132a25;--card2:#0f211d;--border:#23463d;--text:#eaf5f1;--muted:#9bb6ae;
-  --accent:#7fd6b8;--ok:#5fd3a0;--warn:#f5b942;--bad:#ff7a70;--info:#6cb6ff;--wet:#5aa9e6;
-  --track:#1c3a33;--shadow:0 1px 2px rgba(0,0,0,.35);
-}
-@media (prefers-color-scheme: light){
-  :root{
-    --bg:#f2f7f5;--card:#ffffff;--card2:#f6faf8;--border:#d3e2db;--text:#13302a;--muted:#587169;
-    --accent:#0d7a5a;--ok:#0f7d5a;--warn:#9a5b00;--bad:#c0352b;--info:#1d68ad;--wet:#2a78b5;
-    --track:#e3eee9;--shadow:0 1px 2px rgba(20,60,50,.10);
-  }
-}
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
-.wrap{max-width:1080px;margin:0 auto;padding:20px 16px 40px}
-a{color:var(--accent)}
-header{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between;margin-bottom:16px}
-h1{font-size:20px;letter-spacing:.04em;margin:0;color:var(--accent)}
-.subtitle{margin:2px 0 0;color:var(--muted);font-size:13px}
-.updated{display:flex;align-items:center;gap:8px;color:var(--muted);font-size:13px}
-.live{width:8px;height:8px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 var(--ok);animation:pulse 2s infinite}
-.live.off{background:var(--bad);animation:none}
-@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(95,211,160,.6)}70%{box-shadow:0 0 0 7px rgba(95,211,160,0)}100%{box-shadow:0 0 0 0 rgba(95,211,160,0)}}
-@media (prefers-reduced-motion: reduce){.live{animation:none}}
-.devices{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px}
-.chip{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border:1px solid var(--border);border-radius:999px;background:var(--card);color:var(--text);text-decoration:none;font-size:13px}
-.chip[aria-current="page"]{border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent)}
-.dot{width:9px;height:9px;border-radius:50%;flex:none;background:var(--muted)}
-.dot.ok{background:var(--ok)}.dot.warn{background:var(--warn)}.dot.bad{background:var(--bad)}.dot.info{background:var(--info)}
-.banner{display:flex;flex-wrap:wrap;align-items:center;gap:10px 14px;padding:14px 16px;border-radius:12px;border:1px solid var(--border);border-left-width:6px;background:var(--card);margin-bottom:16px;box-shadow:var(--shadow)}
-.banner.ok{border-left-color:var(--ok)}.banner.warn{border-left-color:var(--warn)}.banner.bad{border-left-color:var(--bad)}
-.banner strong{font-size:17px}
-.banner span.msg{color:var(--muted)}
-.notice{padding:10px 14px;border-radius:10px;background:var(--card2);border:1px dashed var(--border);color:var(--muted);font-size:13px;margin-bottom:16px}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:14px}
-.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(320px,100%),1fr));gap:14px;margin-bottom:14px;align-items:start}
-.stack{display:grid;gap:14px;min-width:0}
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;box-shadow:var(--shadow);min-width:0;margin-bottom:14px}
-.grid .card,.grid2 .card,.stack .card{margin-bottom:0}
-.label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
-.value{font-size:30px;font-weight:700;margin-top:4px;line-height:1.15}
-.value small{font-size:14px;font-weight:500;color:var(--muted);margin-left:4px}
-.sub{font-size:13px;color:var(--muted);margin-top:6px}
-.tag{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:600;border:1px solid currentColor;vertical-align:middle;margin-left:6px}
-.tag.ok{color:var(--ok)}.tag.warn{color:var(--warn)}.tag.bad{color:var(--bad)}.tag.info{color:var(--info)}.tag.muted{color:var(--muted)}
-.na{color:var(--bad)}
-/* moisture gauge: three zones bounded by the agronomy thresholds */
-.gauge{position:relative;height:14px;border-radius:7px;margin:16px 0 4px;overflow:visible}
-.gauge .zones{position:absolute;inset:0;border-radius:7px;opacity:.85}
-.gauge .marker{position:absolute;top:-5px;width:4px;height:24px;margin-left:-2px;border-radius:2px;background:var(--text);box-shadow:0 0 0 2px var(--card)}
-.gauge-scale{position:relative;height:16px;font-size:11px;color:var(--muted)}
-.gauge-scale span{position:absolute;transform:translateX(-50%);white-space:nowrap}
-.gauge-legend{display:flex;justify-content:space-between;gap:8px;font-size:11px;color:var(--muted);margin-top:2px}
-/* crop progress: a progress bar, a schedule strip beneath it, and a "today" marker across both */
-.timeline{position:relative;margin:16px 0 10px}
-.bar{position:relative;height:12px;border-radius:6px;background:var(--track);overflow:hidden}
-.bar .fill{position:absolute;left:0;top:0;bottom:0;background:var(--accent);border-radius:6px}
-.sched{position:relative;height:8px;margin-top:5px;border-radius:4px;background:var(--track);overflow:hidden}
-.sched .win{position:absolute;top:0;bottom:0;background:var(--info)}
-.sched .win.harvest{background:var(--warn)}
-.timeline .today{position:absolute;top:-4px;bottom:-4px;width:3px;margin-left:-1.5px;border-radius:2px;background:var(--text);box-shadow:0 0 0 2px var(--card)}
-.legend{display:flex;flex-wrap:wrap;gap:6px 16px;font-size:12px;color:var(--muted)}
-.legend i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
-/* forecast */
-.fc{display:grid;grid-template-columns:78px 1fr 58px;gap:8px;align-items:center;font-size:13px;margin-top:8px}
-.fc .b{height:8px;border-radius:4px;background:var(--track);overflow:hidden}
-.fc .b i{display:block;height:100%;background:var(--wet)}
-.fc .b i.heavy{background:var(--warn)}
-.fc .mm{text-align:right;color:var(--muted)}
-/* alerts + delivery */
-h2{font-size:14px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:22px 0 10px}
-.alerts{list-style:none;margin:0;padding:0;display:grid;gap:8px}
-.alerts li{display:flex;gap:12px;align-items:flex-start;padding:12px 14px;background:var(--card);border:1px solid var(--border);border-left-width:5px;border-radius:10px}
-.alerts li.bad{border-left-color:var(--bad)}.alerts li.warn{border-left-color:var(--warn)}.alerts li.info{border-left-color:var(--info)}.alerts li.muted{border-left-color:var(--muted)}
-.alerts .txt{flex:1;min-width:0}
-.alerts code{font-size:11px;color:var(--muted);word-break:break-all}
-.none{padding:14px;color:var(--muted);background:var(--card);border:1px solid var(--border);border-radius:10px}
-.rows{display:grid;gap:0}
-.rows .r{display:flex;justify-content:space-between;gap:12px;padding:8px 0;border-bottom:1px solid var(--border)}
-.rows .r:last-child{border-bottom:0}
-.rows .r span:first-child{color:var(--muted)}
-footer{margin-top:28px;color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;gap:4px 18px}
-.empty{text-align:center;padding:56px 20px;background:var(--card);border:1px dashed var(--border);border-radius:14px}
-.empty h2{margin:0 0 8px;font-size:18px;text-transform:none;letter-spacing:0;color:var(--text)}
-.empty p{margin:6px auto;max-width:520px;color:var(--muted)}
-.empty code{background:var(--card2);padding:2px 6px;border-radius:5px;border:1px solid var(--border)}
-"""
+CSS = """
+:root { --bg:#22252b; --surface:#292d34; --surface-hi:#30343c; --text:#f4f5f8; --muted:#9ba2af;
+        --ok:#a94dff; --blue:#3478ff; --warn:#f2a83b; --wet:#4d87ff; --bad:#ef6670; --off:#606773;
+        --shadow-dark:#191b20; --shadow-light:#333841; }
+* { box-sizing:border-box; }
+body { max-width:1180px; min-height:100vh; margin:0 auto; padding:32px; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; background:var(--bg); color:var(--text); }
+h1 { font-size:13px; color:#dfe2e8; margin:0 0 5px; letter-spacing:.13em; font-weight:750; }
+h2 { font-size:11px; margin:28px 0 12px; color:var(--muted); text-transform:uppercase; letter-spacing:.12em; }
+.subtitle { color:var(--muted); margin:0 0 22px; font-size:13px; }
+.devices { display:flex; gap:10px; flex-wrap:wrap; margin:0 0 20px; }
+.devices a, .refresh-btn, .lang-chip { color:var(--text); text-decoration:none; border:0; background:var(--surface); box-shadow:5px 5px 10px var(--shadow-dark), -4px -4px 9px var(--shadow-light); border-radius:12px; padding:8px 14px; font-size:12px; transition:transform .15s, box-shadow .15s, color .15s; }
+.devices a:hover, .refresh-btn:hover, .lang-chip:hover { color:#d9b4ff; transform:translateY(-1px); }
+.devices a[aria-current="page"], .lang-chip.active { color:#fff; font-weight:700; background:linear-gradient(145deg,#a74fff,#4c6fff); box-shadow:inset 2px 2px 5px #7140bd, inset -2px -2px 5px #758cff, 0 0 16px #914dff66; }
+.notice { background:#382f22; box-shadow:inset 2px 2px 5px #241e16, inset -2px -2px 5px #4b3f2d; border-radius:14px; padding:12px 15px; margin-bottom:18px; font-size:13px; color:#f6ca79; }
+.status { display:flex; align-items:center; gap:11px; font-size:28px; letter-spacing:-.035em; font-weight:750; margin:4px 0; }
+.status.ok { color:#ddc4ff; } .status.warn { color:#ffd17b; } .status.bad { color:#ff9ba2; } .status.off { color:var(--muted); }
+.live { width:12px; height:12px; border-radius:50%; background:var(--ok); box-shadow:0 0 0 5px #a94dff20, 0 0 14px var(--ok); display:inline-block; }
+.live.off { background:var(--off); box-shadow:none; }
+.grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(205px,1fr)); gap:18px; margin-top:18px; }
+.card { min-height:142px; background:var(--surface); border:0; border-radius:18px; padding:18px; box-shadow:8px 8px 16px var(--shadow-dark), -6px -6px 14px var(--shadow-light); }
+.label { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.12em; font-weight:700; }
+.value { font-size:29px; letter-spacing:-.045em; font-weight:750; margin-top:10px; }
+.sub { font-size:12px; color:var(--muted); margin-top:6px; line-height:1.4; }
+.na { color:var(--muted); font-weight:400; }
+.tag { display:inline-block; font-size:11px; font-weight:700; letter-spacing:.03em; border-radius:999px; padding:5px 10px; margin-top:12px; background:var(--off); box-shadow:inset 1px 1px 3px #4b5059, inset -1px -1px 3px #737b88; }
+.tag.ok { background:#854bd3; } .tag.warn { background:var(--warn); color:#342300; } .tag.wet { background:var(--wet); } .tag.bad { background:var(--bad); } .tag.off { background:var(--off); }
+.gauge { position:relative; height:12px; border-radius:999px; margin-top:16px; box-shadow:inset 3px 3px 6px #1a1d22, inset -2px -2px 4px #363b44; }
+.marker { position:absolute; top:-5px; width:5px; height:22px; background:#fff; border-radius:4px; margin-left:-2px; box-shadow:0 0 8px #fff; }
+ul.alerts { list-style:none; padding:0; margin:0; display:grid; gap:10px; }
+ul.alerts li { background:var(--surface); box-shadow:6px 6px 13px var(--shadow-dark), -5px -5px 11px var(--shadow-light); border:0; border-left:4px solid var(--off); border-radius:14px; padding:12px 15px; font-size:14px; }
+ul.alerts li.bad { border-left-color:var(--bad); } ul.alerts li.warn { border-left-color:var(--warn); } ul.alerts li.wet { border-left-color:var(--wet); } ul.alerts li.info { border-left-color:var(--off); }
+code { color:#c7a8f3; font-size:11px; margin-left:7px; }
+ul.forecast { list-style:none; padding:0; margin:12px 0 0; font-size:12px; } ul.forecast li { display:flex; justify-content:space-between; padding:4px 0; } .heavy { color:#ffc85a; font-weight:700; }
+.verdict { font-size:17px; font-weight:700; margin-top:10px; }.note { font-size:12px; color:var(--muted); margin:8px 0 0; line-height:1.45; }
+.row { display:flex; justify-content:space-between; align-items:center; max-width:410px; padding:11px 13px; margin-bottom:8px; background:var(--surface); box-shadow:inset 2px 2px 5px var(--shadow-dark), inset -2px -2px 5px var(--shadow-light); border-radius:10px; font-size:14px; }.muted { color:#7d8490; font-size:12px; margin-top:26px; }
+.demo-panel { margin-top:28px; padding:20px; background:var(--surface); border:0; border-radius:20px; box-shadow:8px 8px 16px var(--shadow-dark), -6px -6px 14px var(--shadow-light); }.demo-panel h2 { color:#d9dce2; }
+.demo-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(210px,1fr)); gap:13px; margin-top:16px; }
+.demo-btn { width:100%; min-height:68px; text-align:left; background:var(--surface); color:var(--text); border:0; border-radius:14px; padding:13px 15px; font-size:13px; font-weight:700; cursor:pointer; box-shadow:6px 6px 12px var(--shadow-dark), -4px -4px 10px var(--shadow-light); transition:transform .15s, box-shadow .15s, color .15s; }.demo-btn:hover { color:#e3c4ff; transform:translateY(-2px); box-shadow:8px 8px 14px var(--shadow-dark), -5px -5px 12px var(--shadow-light), 0 0 12px #a94dff33; }.demo-btn:active { transform:translateY(1px); box-shadow:inset 4px 4px 8px var(--shadow-dark), inset -3px -3px 7px var(--shadow-light); }.demo-btn small { display:block; color:var(--muted); font-size:11px; line-height:1.35; margin-top:5px; font-weight:400; }
+.demo-locked { color:var(--muted); font-size:13px; line-height:1.5; }.demo-locked code { background:#20232a; padding:2px 5px; border-radius:5px; }
+.unlock { display:flex; gap:12px; flex-wrap:wrap; margin-top:14px; }.unlock input { background:var(--surface); color:var(--text); border:0; box-shadow:inset 3px 3px 6px var(--shadow-dark), inset -2px -2px 5px var(--shadow-light); border-radius:12px; padding:12px 14px; font-size:13px; min-width:220px; outline:0; }.unlock input:focus { box-shadow:inset 3px 3px 6px var(--shadow-dark), inset -2px -2px 5px var(--shadow-light), 0 0 0 2px #a94dff77; }.unlock .demo-btn { width:auto; min-height:0; text-align:center; }
+.lang-row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:16px; }.lang-row form { margin:0; }span.lang-chip { cursor:default; }.lang-chip { cursor:pointer; font-family:inherit; padding:7px 14px; }.lang-chip.active { cursor:default; }
+.sms-banner { border:0; border-left:4px solid var(--off); border-radius:14px; background:var(--surface); box-shadow:6px 6px 13px var(--shadow-dark), -5px -5px 11px var(--shadow-light); padding:13px 16px; margin-bottom:18px; font-size:14px; }.sms-banner.ok { border-left-color:var(--ok); }.sms-banner.bad { border-left-color:var(--bad); }.sms-banner summary { cursor:pointer; color:var(--muted); font-size:12px; margin-top:8px; }.sms-banner pre { white-space:pre-wrap; word-break:break-word; background:#20232a; border:0; box-shadow:inset 2px 2px 5px var(--shadow-dark); border-radius:9px; padding:9px 11px; margin:8px 0 0; font-family:inherit; font-size:13px; }
+.refresh-btn { display:inline-block; margin-left:10px; color:#dfc4ff; padding:6px 11px; }
+@media (max-width:560px) { body { padding:20px; }.status { font-size:24px; }.grid { grid-template-columns:1fr; gap:14px; }.card { min-height:0; }.refresh-btn { margin:9px 0 0; }.subtitle { display:flex; flex-direction:column; align-items:flex-start; } }
 
-_JS = """
-(function(){
-  var els=document.querySelectorAll('[data-ts]');
-  if(!els.length)return;
-  function fmt(s){
-    if(s<5)return 'just now';
-    if(s<60)return s+'s ago';
-    if(s<3600)return Math.floor(s/60)+' min ago';
-    if(s<86400)return Math.floor(s/3600)+' h ago';
-    return Math.floor(s/86400)+' d ago';
-  }
-  function tick(){
-    var now=Date.now()/1000;
-    els.forEach(function(el){
-      var s=Math.max(0,Math.round(now-parseFloat(el.getAttribute('data-ts'))));
-      el.textContent=fmt(s);
-    });
-  }
-  tick();setInterval(tick,1000);
-})();
+/* App workspace: a calmer green, white and charcoal dashboard rather than a full-screen control panel. */
+:root { --bg:#e9f0eb; --surface:#ffffff; --surface-soft:#f4f8f5; --text:#17231c; --muted:#718077; --ok:#197a45; --blue:#197a45; --warn:#d99625; --wet:#2f8cce; --bad:#d94c55; --off:#aebbb3; --line:#dce6df; --shadow-dark:#c9d5cd; --shadow-light:#ffffff; }
+body { max-width:none; padding:0; background:var(--bg); color:var(--text); font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+.app-shell { display:flex; min-height:100vh; }
+.rail { width:82px; flex:0 0 82px; background:#17231c; display:flex; flex-direction:column; align-items:center; padding:22px 12px; }
+.brand { width:42px; height:42px; display:grid; place-items:center; border-radius:14px; background:#2aa260; color:#fff; box-shadow:0 7px 16px #06130b55; font-size:21px; font-weight:800; text-decoration:none; }
+.rail-links { display:grid; gap:12px; margin-top:45px; }.rail-links a { width:42px; height:42px; border-radius:13px; display:grid; place-items:center; color:#b9c9bf; text-decoration:none; font-size:18px; }.rail-links a.active, .rail-links a:hover { color:#fff; background:#2aa260; box-shadow:0 7px 16px #0b442655; }
+.rail-footer { margin-top:auto; color:#8ea097; font-size:11px; writing-mode:vertical-rl; transform:rotate(180deg); letter-spacing:.12em; }
+.workspace { flex:1; min-width:0; padding:30px clamp(22px,4vw,64px) 42px; }.topbar { max-width:1200px; margin:0 auto 26px; display:flex; align-items:flex-start; justify-content:space-between; gap:22px; }.eyebrow { color:var(--ok); margin:0 0 9px; font-weight:750; letter-spacing:.12em; font-size:10px; text-transform:uppercase; }
+h1 { color:var(--text); font-size:28px; line-height:1.1; letter-spacing:-.045em; margin:0 0 7px; }.subtitle { color:var(--muted); margin:0; font-size:13px; }.topbar-meta { background:var(--surface); border:1px solid var(--line); border-radius:14px; padding:11px 14px; min-width:150px; display:flex; align-items:center; gap:9px; box-shadow:0 7px 20px #405c4910; font-size:12px; color:var(--muted); }.topbar-meta strong { display:block; color:var(--text); font-size:13px; }.topbar-meta .live { flex:0 0 auto; }
+.content { max-width:1200px; margin:0 auto; }.refresh-btn { margin:0 0 0 9px; color:var(--ok); background:transparent; box-shadow:none; border:1px solid #b7d8c3; border-radius:8px; padding:5px 9px; }.refresh-btn:hover { color:#fff; background:var(--ok); transform:none; }
+.devices { padding:6px; gap:5px; margin-bottom:22px; display:inline-flex; background:#dfe8e2; border-radius:11px; }.devices a { color:var(--muted); padding:7px 12px; background:transparent; box-shadow:none; border-radius:7px; }.devices a:hover { color:var(--ok); background:#fff; transform:none; }.devices a[aria-current="page"] { color:var(--ok); background:#fff; box-shadow:0 2px 7px #58706322; }
+.status { color:var(--text); font-size:25px; letter-spacing:-.04em; }.status.ok { color:var(--text); }.status.warn { color:#8d6115; }.status.bad { color:#9e3038; }.live { background:var(--ok); box-shadow:0 0 0 5px #1a9b5630; }.live.off { background:var(--off); box-shadow:none; }
+.grid { grid-template-columns:repeat(auto-fit,minmax(215px,1fr)); gap:16px; margin-top:17px; }.card { min-height:154px; background:var(--surface); border:1px solid var(--line); border-radius:15px; padding:18px; box-shadow:0 8px 22px #3552400d; }.card:hover { border-color:#bcd6c5; box-shadow:0 10px 25px #35524017; }.label { color:var(--muted); letter-spacing:.09em; }.value { color:var(--text); font-size:28px; }.tag { background:#e5ece8; color:#52635a; box-shadow:none; padding:5px 9px; }.tag.ok { color:#fff; background:var(--ok); }.tag.warn { background:#ffedce; color:#8b5c08; }.tag.wet { background:#dceefe; color:#1767a6; }.tag.bad { background:#fde1e3; color:#a72c36; }.tag.off { background:#e4e9e6; color:#69776f; }.gauge { box-shadow:none; }.marker { box-shadow:0 0 6px #25332b; }
+h2 { color:#617168; letter-spacing:.1em; margin:29px 0 11px; }ul.alerts li, .sms-banner { background:#fff; border:1px solid var(--line); box-shadow:0 7px 20px #3552400c; border-left-width:4px; border-radius:12px; }code { color:#177443; }.row { background:#fff; box-shadow:none; border:1px solid var(--line); border-radius:10px; }.muted { color:var(--muted); }
+.demo-panel { background:#f7faf8; border:1px solid var(--line); border-radius:16px; box-shadow:none; padding:20px; }.demo-panel h2 { color:var(--text); }.demo-btn { min-height:70px; background:#fff; color:var(--text); border:1px solid var(--line); border-radius:11px; box-shadow:0 5px 14px #3552400b; }.demo-btn:hover { color:#fff; background:var(--ok); border-color:var(--ok); transform:translateY(-2px); box-shadow:0 9px 17px #197a4530; }.demo-btn:hover small { color:#d6f1df; }.demo-btn:active { box-shadow:inset 2px 2px 5px #0f6136; }.unlock input { background:#fff; color:var(--text); border:1px solid var(--line); box-shadow:none; }.unlock input:focus { box-shadow:0 0 0 3px #197a4522; }.lang-chip { color:#466053; background:#fff; border:1px solid var(--line); box-shadow:none; border-radius:8px; }.lang-chip:hover { color:var(--ok); border-color:#9bc9aa; transform:none; }.lang-chip.active { color:#fff; background:var(--ok); border-color:var(--ok); box-shadow:none; }.sms-banner pre { background:#f3f7f4; box-shadow:none; }.notice { background:#fff8e9; color:#805910; box-shadow:none; border:1px solid #f0d69e; }
+@media (max-width:700px) { .rail { width:60px; flex-basis:60px; padding:16px 9px; }.brand,.rail-links a { width:37px; height:37px; }.rail-links { margin-top:30px; }.workspace { padding:24px 18px 35px; }.topbar { display:block; }.topbar-meta { margin-top:18px; width:max-content; }.grid { grid-template-columns:1fr; } }
+
+/* Polish pass (kept last so it wins): contrast, wrapping, Indic fonts, status dot, phone layout. */
+:root { --muted:#5b6a61; }
+body { font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI","Nirmala UI","Noto Sans Devanagari","Noto Sans Kannada",sans-serif; }
+button, input { font-family:inherit; }
+.heavy { color:#9a5b00; }
+.demo-locked code { background:#eaf1ec; color:#177443; }
+.marker { background:#17231c; border:2px solid #fff; box-shadow:0 1px 4px #17231c66; }
+.unlock input:focus { border-color:var(--ok); box-shadow:0 0 0 3px #197a4544; }
+.sms-banner, .notice, .tag, .devices a { overflow-wrap:anywhere; }
+.sms-banner pre { line-height:1.6; }
+span.lang-chip:hover { color:#466053; border-color:var(--line); }
+.grid.stale { opacity:.5; }
+.live.warn { background:var(--warn); box-shadow:0 0 0 5px #d9962530; }
+.live.bad { background:var(--bad); box-shadow:0 0 0 5px #d94c5530; }
+.unlock-link { display:inline-block; text-decoration:none; width:auto; min-height:0; text-align:center; margin-top:12px; }
+@media (max-width:560px) { .card { min-height:0; }.refresh-btn { margin:9px 0 0; }.unlock input, .unlock .demo-btn { width:100%; min-width:0; } }
+
+/* No side panel: one clean column. Control panel = a row of pill buttons at the top. */
+.app-shell { display:block; }
+.workspace { max-width:1240px; margin:0 auto; }
+.demo-panel { margin:0 0 18px; padding:16px 18px; }
+.demo-panel h2 { margin:0; }
+.panel-head { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; }
+.hint { text-transform:none; letter-spacing:0; font-weight:500; color:var(--muted); font-size:12px; margin-left:6px; }
+.panel-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.panel-actions form, .pill-row form { margin:0; }
+.pill-row { display:flex; flex-wrap:wrap; gap:8px; margin-top:14px; }
+.pill { display:inline-block; font:inherit; font-size:13px; font-weight:600; color:var(--text); background:#fff; border:1px solid var(--line); border-radius:999px; padding:8px 15px; cursor:pointer; text-decoration:none; transition:background .15s, color .15s, border-color .15s; }
+.pill:hover { color:#fff; background:var(--ok); border-color:var(--ok); }
+.pill.primary { color:#fff; background:var(--ok); border-color:var(--ok); }
+.pill.primary:hover { filter:brightness(1.12); }
+.pill.quiet { color:var(--muted); background:transparent; }
+.pill.quiet:hover { color:var(--text); background:#e5ece8; border-color:var(--line); }
+.sim-notice { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:12px; background:#fff8e9; color:#805910; border:1px solid #f0d69e; border-radius:12px; padding:12px 16px; margin-bottom:18px; font-size:14px; }
+.sim-notice form { margin:0; }
 """
 
 
-# ------------------------------------------------------------------ helpers
-
-def _e(value) -> str:
-    return escape(str(value), quote=True)
-
-
-def _fmt(value, fmt: str = "{:.0f}") -> str:
-    if value is None:
-        return '<span class="na">N/A</span>'
-    try:
-        return fmt.format(value)
-    except (ValueError, TypeError):
-        return _e(value)
-
-
-def _ago_text(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    if seconds < 5:
+def _ago(delta_seconds: float) -> str:
+    seconds = max(int(delta_seconds), 0)
+    if seconds < 10:
         return "just now"
     if seconds < 60:
-        return f"{seconds}s ago"
-    if seconds < 3600:
-        return f"{seconds // 60} min ago"
-    if seconds < 86400:
-        return f"{seconds // 3600} h ago"
-    return f"{seconds // 86400} d ago"
+        return f"{seconds} s ago"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes} min ago"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours} h ago"
+    return f"{hours // 24} d ago"
 
 
 def _parse_time(value):
@@ -184,312 +166,490 @@ def _parse_time(value):
         return None
 
 
-def _time_html(value, now: datetime) -> str:
-    """Relative time that ticks live in the browser, with a correct server-side fallback."""
-    ts = _parse_time(value)
-    if ts is None:
-        return "unknown"
-    return f'<span data-ts="{ts.timestamp():.0f}">{_ago_text((now - ts).total_seconds())}</span>'
+def _plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
-def _severity(code: str) -> str:
-    # Anything not listed (fertilizer / harvest reminders) is something for the farmer to do.
-    return _CODE_SEVERITY.get(code, "info")
+def _rule_name(rule: dict) -> str:
+    return rule["id"].split("-", 1)[-1].capitalize()      # "FERT-TILLERING" -> "Tillering"
 
 
-def _overall_status(codes: list, stale: bool):
-    """Returns (level, headline, detail) for the banner and the device chip."""
-    if stale:
-        return "bad", "No recent data", "The device has stopped reporting. Check its power and Wi-Fi."
-    if any(c.startswith("SENSOR_FAULT") for c in codes):
-        return "bad", "Sensor fault", "A sensor is not responding, so some readings below are unavailable."
-    actionable = [c for c in codes if c in ACTIONABLE_CODES]
-    if actionable:
-        n = len(actionable)
-        return "warn", "Attention needed", f"{n} active alert{'s' if n != 1 else ''} for this field."
-    return "ok", "All clear", "Readings are within the expected range. No action needed."
-
-
-def _stage_summary(days: int, maturity: int) -> str:
-    """One sentence on where the crop is in its schedule."""
-    if days >= maturity:
-        return "Estimated maturity reached. Check grain colour and moisture before harvesting."
+def _stage_summary(days: int, maturity_days: int) -> str:
+    """One line on what the crop is doing / what is coming next, from days since sowing."""
+    remaining = maturity_days - days
+    if remaining <= 0:
+        return "Estimated maturity reached."
+    if remaining <= HARVEST_APPROACHING_WINDOW_DAYS:
+        return f"Harvest window approaching: about {_plural(remaining, 'day')} to go."
     for rule in FERTILIZER_RULES:
         lo, hi = rule["window"]
-        if lo == hi:
-            continue
-        name = rule["id"].replace("FERT-", "").title()
         if lo <= days <= hi:
-            return f"{name} fertilizer window is open now (until day {hi})."
-        if days < lo:
-            n = lo - days
-            return f"Next: {name.lower()} fertilizer window opens in {n} day{'s' if n != 1 else ''} (day {lo})."
-    remaining = maturity - days
-    if remaining <= HARVEST_APPROACHING_WINDOW_DAYS:
-        return f"Harvest window approaching: about {remaining} day{'s' if remaining != 1 else ''} to go."
+            return f"{_rule_name(rule)} fertilizer window is open now (until day {hi})."
+    for rule in FERTILIZER_RULES:
+        lo, _ = rule["window"]
+        if lo > days:
+            return f"Next: {_rule_name(rule).lower()} fertilizer window opens in {_plural(lo - days, 'day')} (day {lo})."
     return f"About {remaining} days until the estimated harvest check."
 
 
-def _card(label: str, value_html: str, sub_html: str = "", cls: str = "") -> str:
-    sub = f'<div class="sub">{sub_html}</div>' if sub_html else ""
-    return f'<div class="card {cls}"><div class="label">{label}</div><div class="value">{value_html}</div>{sub}</div>'
+def _num(value, fmt: str):
+    """Format a number, or None if it is missing / not a number."""
+    try:
+        return format(float(value), fmt)
+    except (TypeError, ValueError):
+        return None
 
 
-# ------------------------------------------------------------------ sections
+def _na(sub: str = "") -> str:
+    note = f'<div class="sub">{escape(sub)}</div>' if sub else ""
+    return f'<div class="value"><span class="na">N/A</span></div>{note}'
+
+
+# ----------------------------------------------------------------- sections
 
 def _moisture_card(facts: dict) -> str:
     moisture = facts.get("soil_moisture_index")
     state = facts.get("moisture_state")
-    tags = {"low": ("warn", "Low"), "normal": ("ok", "Normal"), "high": ("warn", "Too wet")}
-    tag_cls, tag_txt = tags.get(state, ("bad", "Sensor fault"))
-    tag = f'<span class="tag {tag_cls}">{tag_txt}</span>'
+    tag = {
+        "low": '<span class="tag warn">Low</span>',
+        "normal": '<span class="tag ok">Normal</span>',
+        "high": '<span class="tag wet">Too wet</span>',
+    }.get(state, '<span class="tag bad">No data</span>')
 
+    label = '<div class="label">Soil moisture index</div>'
     if moisture is None:
-        return (
-            '<div class="card wide"><div class="label">Soil moisture index</div>'
-            f'<div class="value"><span class="na">N/A</span>{tag}</div>'
-            '<div class="sub">The soil moisture sensor is not reporting.</div></div>'
-        )
+        return f'<div class="card">{label}{_na()}{tag}</div>'
 
-    pct = max(0.0, min(100.0, float(moisture)))
     lo, hi = MOISTURE_LOW_ENTER, MOISTURE_HIGH_ENTER
-    zones = f"linear-gradient(90deg,var(--warn) 0 {lo}%,var(--ok) {lo}% {hi}%,var(--wet) {hi}% 100%)"
-    return f"""
-    <div class="card wide">
-      <div class="label">Soil moisture index</div>
-      <div class="value">{pct:.0f}<small>/ 100</small>{tag}</div>
-      <div class="gauge" role="meter" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{pct:.0f}"
-           aria-label="Soil moisture index {pct:.0f} out of 100, {tag_txt}">
-        <div class="zones" style="background:{zones}"></div>
-        <div class="marker" style="left:{pct}%"></div>
-      </div>
-      <div class="gauge-scale"><span style="left:0%">0</span><span style="left:{lo}%">{lo:.0f}</span>
-        <span style="left:{hi}%">{hi:.0f}</span><span style="left:100%">100</span></div>
-      <div class="gauge-legend"><span>Dry: irrigate</span><span>Normal</span><span>Waterlogged: drain</span></div>
-      <div class="sub">A relative index from the probe, not a volumetric percentage.</div>
-    </div>"""
-
-
-def _weather_card(facts: dict) -> str:
-    if not facts.get("weather_checked", True):
-        return _card(
-            "Rain forecast", '<span style="font-size:18px">Not checked</span>',
-            "The forecast is only fetched when an alert needs it.",
-        )
-    if not facts.get("weather_available"):
-        return _card(
-            "Rain forecast", '<span style="font-size:18px" class="na">Unavailable</span>',
-            "The weather service did not respond. This does not mean no rain.",
-        )
-    headline = "Rain expected" if facts.get("rain_expected_next_days") else "No significant rain"
-    forecast = facts.get("weather_forecast") or []
-    scale = max([RAIN_THRESHOLD_MM * 2] + [f.get("rain_mm") or 0 for f in forecast])
-    rows = ""
-    for f in forecast[:3]:
-        mm = f.get("rain_mm") or 0
-        try:
-            day = datetime.strptime(f.get("date", ""), "%Y-%m-%d").strftime("%a %d %b")
-        except ValueError:
-            day = f.get("date") or "?"
-        heavy = "heavy" if mm >= RAIN_THRESHOLD_MM else ""
-        rows += (
-            f'<div class="fc"><span>{_e(day)}</span>'
-            f'<div class="b"><i class="{heavy}" style="width:{min(100, mm / scale * 100):.0f}%"></i></div>'
-            f'<span class="mm">{mm:.1f} mm</span></div>'
-        )
+    position = min(max(float(moisture), 0.0), 100.0)
+    gradient = (
+        f"linear-gradient(to right, var(--warn) 0 {lo:.1f}%, "
+        f"var(--ok) {lo:.1f}% {hi:.1f}%, var(--wet) {hi:.1f}% 100%)"
+    )
     return (
-        '<div class="card"><div class="label">Rain forecast (3 days)</div>'
-        f'<div class="value" style="font-size:20px">{headline}</div>{rows}</div>'
+        f'<div class="card">{label}'
+        f'<div class="value">{escape(format(float(moisture), "g"))} <span class="na">/ 100</span></div>'
+        f'<div class="gauge" role="meter" aria-label="Soil moisture index" aria-valuemin="0" aria-valuemax="100" '
+        f'aria-valuenow="{escape(format(float(moisture), "g"))}" style="background:{gradient}">'
+        f'<span class="marker" style="left:{position:.1f}%"></span></div>'
+        f"{tag}</div>"
     )
 
 
-def _crop_card(facts: dict) -> str:
-    days = facts.get("days_since_sowing")
-    maturity = int((facts.get("crop_profile") or {}).get("maturity_days") or 0)
-    if days is None or maturity <= 0:
-        return _card("Crop age", _fmt(None))
+def _dht_card(label: str, formatted, fault: bool) -> str:
+    if formatted is not None:
+        return f'<div class="card"><div class="label">{label}</div><div class="value">{formatted}</div></div>'
+    note = "DHT22 sensor not responding" if fault else "No data"
+    return f'<div class="card"><div class="label">{label}</div>{_na(note)}</div>'
 
-    pct = min(100.0, days / maturity * 100)
-    wins = ""
-    for rule in FERTILIZER_RULES:
-        lo, hi = rule["window"]
-        if lo == hi:
-            continue
-        wins += f'<div class="win" style="left:{lo / maturity * 100:.1f}%;width:{(hi - lo + 1) / maturity * 100:.1f}%"></div>'
-    h_start = max(0, maturity - HARVEST_APPROACHING_WINDOW_DAYS)
-    wins += f'<div class="win harvest" style="left:{h_start / maturity * 100:.1f}%;right:0"></div>'
-    return f"""
-    <div class="card">
-      <div class="label">Crop progress</div>
-      <div class="value">Day {days}<small>of about {maturity}</small></div>
-      <div class="timeline" role="progressbar" aria-valuemin="0" aria-valuemax="{maturity}" aria-valuenow="{min(days, maturity)}"
-           aria-label="Crop age {days} days of {maturity}">
-        <div class="bar"><div class="fill" style="width:{pct:.1f}%"></div></div>
-        <div class="sched">{wins}</div>
-        <div class="today" style="left:{pct:.1f}%"></div>
-      </div>
-      <div class="legend"><span><i style="background:var(--accent)"></i>Days since sowing</span>
-        <span><i style="background:var(--info)"></i>Fertilizer windows</span>
-        <span><i style="background:var(--warn)"></i>Harvest window</span></div>
-      <div class="sub">{_e(_stage_summary(days, maturity))}</div>
-    </div>"""
+
+def _weather_card(facts: dict, codes: list) -> str:
+    label = '<div class="label">Rain forecast (3 days)</div>'
+    if facts.get("weather_available"):
+        rain = facts.get("rain_expected_next_days")
+        verdict = "Rain expected" if rain else "No significant rain expected"
+        rows = ""
+        for day in facts.get("weather_forecast") or []:
+            try:
+                name = datetime.strptime(str(day.get("date")), "%Y-%m-%d").strftime("%a %d %b")
+            except ValueError:
+                name = str(day.get("date"))
+            mm = _num(day.get("rain_mm"), ".1f")
+            if mm is None:
+                amount = '<span class="na">no data</span>'
+            elif float(mm) >= RAIN_THRESHOLD_MM:
+                amount = f'<span class="heavy">{mm} mm</span>'
+            else:
+                amount = f"<span>{mm} mm</span>"
+            rows += f"<li><span>{escape(name)}</span>{amount}</li>"
+        listing = f'<ul class="forecast">{rows}</ul>' if rows else ""
+        return f'<div class="card">{label}<div class="verdict">{verdict}</div>{listing}</div>'
+
+    if "WEATHER_UNAVAILABLE" in codes:
+        return (
+            f'<div class="card">{label}<div class="verdict">Unavailable</div>'
+            '<p class="note">The forecast could not be fetched. This does not mean no rain.</p></div>'
+        )
+    return (
+        f'<div class="card">{label}<div class="verdict">Not checked</div>'
+        '<p class="note">The forecast is only fetched when a new alert is being sent.</p></div>'
+    )
 
 
 def _mandi_card(facts: dict) -> str:
     mandi = facts.get("mandi") or {}
     if not mandi.get("available"):
         return ""
-    rng = ""
-    if mandi.get("min_price") and mandi.get("max_price"):
-        rng = f" &middot; range Rs {_e(mandi['min_price'])} to {_e(mandi['max_price'])}"
-    return _card(
-        "Mandi price",
-        f"Rs {_fmt(mandi.get('modal_price'), '{:,.0f}')}<small>/ quintal</small>",
-        f"{_e(mandi.get('market', 'unknown market'))}, {_e(mandi.get('arrival_date', 'date unknown'))}{rng}",
+    price = _num(mandi.get("modal_price"), ",.0f")
+    if price is None:
+        return ""
+    where = ", ".join(escape(str(x)) for x in (mandi.get("market"), mandi.get("arrival_date")) if x)
+    low, high = mandi.get("min_price"), mandi.get("max_price")
+    spread = f'<div class="sub">range Rs {escape(str(low))} to {escape(str(high))}</div>' if low and high else ""
+    return (
+        '<div class="card"><div class="label">Mandi price</div>'
+        f'<div class="value">Rs {price}</div><div class="sub">per quintal &middot; {where}</div>{spread}</div>'
     )
 
 
-def _alerts_html(codes: list, weather_checked: bool) -> str:
-    # WEATHER_UNAVAILABLE on a reading that never fetched weather is an artefact, not a real alert.
-    shown = [c for c in codes if not (c == "WEATHER_UNAVAILABLE" and not weather_checked)]
-    if not shown:
-        return '<div class="none">No active alerts.</div>'
-    shown.sort(key=lambda c: (_SEVERITY_ORDER[_severity(c)], c))
-    items = ""
-    for code in shown:
-        sev = _severity(code)
-        text = ALERT_CODE_DESCRIPTIONS.get(code, code)
-        items += (
-            f'<li class="{sev}"><span class="tag {sev}" style="margin:0">{_SEVERITY_LABEL[sev]}</span>'
-            f'<div class="txt">{_e(text)}<br><code>{_e(code)}</code></div></li>'
-        )
+def _alerts_section(codes: list) -> str:
+    if not codes:
+        return "<p>No active alerts.</p>"
+    known = [(ALERTS.get(c, ("warn", c)), c) for c in codes]
+    known.sort(key=lambda item: (_SEVERITY_ORDER[item[0][0]], item[1]))
+    items = "".join(
+        f'<li class="{severity}">{escape(text)}<code>{escape(code)}</code></li>'
+        for (severity, text), code in known
+    )
     return f'<ul class="alerts">{items}</ul>'
 
 
-def _delivery_html(snapshot: dict, now: datetime) -> str:
+def _delivery_section(snapshot: dict, now: datetime) -> str:
     delivery = snapshot.get("delivery")
     if not delivery:
-        return '<div class="none">No advisory has been sent yet. One goes out when a new alert appears.</div>'
+        return "<h2>Delivery</h2><p>No advisory has been sent yet.</p>"
 
-    def status(text):
-        text = str(text or "-")
-        cls = "ok" if text == "sent" else "bad" if text.startswith("failed") else "muted"
-        return f'<span class="tag {cls}" style="margin:0">{_e(text)}</span>'
+    def row(name: str, status) -> str:
+        status = str(status if status is not None else "-")
+        kind = "ok" if status.startswith("sent") else "bad" if status.startswith("failed") else "off"
+        return f'<div class="row"><span>{name}</span><span class="tag {kind}" style="margin:0">{escape(status)}</span></div>'
 
-    return f"""
-    <div class="card"><div class="rows">
-      <div class="r"><span>SMS</span>{status(delivery.get('sms_status'))}</div>
-      <div class="r"><span>Voice call</span>{status(delivery.get('voice_status'))}</div>
-      <div class="r"><span>Sent</span><span>{_time_html(snapshot.get('delivery_at'), now)}</span></div>
-    </div></div>"""
+    sent_at = _parse_time(snapshot.get("delivery_at"))
+    when = f" &middot; {_ago((now - sent_at).total_seconds())}" if sent_at else ""
+    return (
+        f"<h2>Last advisory sent{when}</h2>"
+        + row("SMS", delivery.get("sms_status"))
+        + row("Voice call", delivery.get("voice_status"))
+    )
 
 
-def _device_chips(device_ids: list, selected: str, now: datetime) -> str:
+def _sms_banner(event: dict, now: datetime) -> str:
+    """
+    The notification for the most recent SMS attempt (automatic, or from a problem introduced by hand):
+    green if the gateway accepted it, red with the error if it did not, plus the exact text and the
+    reading time it was built from.
+    """
+    if not event:
+        return ""
+    ok = bool(event.get("ok"))
+    sent_at = _parse_time(event.get("sent_at"))
+    reading_at = _parse_time(event.get("reading_at"))
+    when = _ago((now - sent_at).total_seconds()) if sent_at else "time unknown"
+    language = SUPPORTED_LANGUAGES.get(event.get("language"), "English")
+    error = escape(str(event.get("error") or "unknown error"))
+
+    if event.get("simulated"):
+        problem = event.get("problem")
+        what = f"Problem introduced: {escape(str(problem))}" if problem else "Problem introduced"
+        if ok:
+            head = f"&#10003; {what} &middot; SMS sent &middot; {escape(when)} &middot; {escape(language)}"
+        else:
+            head = f"&#10007; {what} &middot; SMS FAILED &middot; {escape(when)} &middot; {error}"
+        sub = "Made-up readings for the demo, not from the field sensor"
+    else:
+        if ok:
+            head = f"&#10003; SMS sent &middot; {escape(when)} &middot; {escape(language)}"
+        else:
+            head = f"&#10007; SMS FAILED &middot; {escape(when)} &middot; {error}"
+        reading = f" &middot; reading taken {escape(reading_at.strftime('%H:%M:%S'))}" if reading_at else ""
+        sub = f"Device {escape(str(event.get('device_id', '?')))}{reading}"
+
+    return (
+        f'<div class="sms-banner {"ok" if ok else "bad"}" role="status"><b>{head}</b>'
+        f'<div class="sub">{sub}</div>'
+        f'<details open><summary>The SMS text</summary><pre lang="{escape(str(event.get("language", "en")))}">'
+        f'{escape(str(event.get("message", "")))}</pre></details>'
+        "</div>"
+    )
+
+
+def _language_row(unlocked: bool, device_id: str) -> str:
+    """
+    English / Hindi / Kannada chips. Unlocked, they are POST buttons that switch the SMS language
+    (automatic SMS and introduced problems alike); locked, they are read-only.
+    """
+    current = get_sms_language()
+    chips = ""
+    for code, name in SUPPORTED_LANGUAGES.items():
+        active = code == current
+        cls = "lang-chip active" if active else "lang-chip"
+        if not unlocked:
+            chips += f'<span class="{cls}" lang="{code}">{escape(name)}</span>'
+        elif active:
+            chips += f'<span class="{cls}" lang="{code}" aria-current="true">{escape(name)}</span>'
+        else:
+            action = f"/settings/sms-language?lang={code}&back=dashboard"
+            if device_id:
+                action += f"&device={quote(device_id, safe='')}"
+            chips += (
+                f'<form method="post" action="{escape(action)}">'
+                f'<button class="{cls}" type="submit" lang="{code}">{escape(name)}</button></form>'
+            )
+    return f'<div class="lang-row"><span class="label">SMS language</span>{chips}</div>'
+
+
+def _demo_panel(
+    unlocked: bool,
+    device_id: str = None,
+    show_key_form: bool = False,
+    key_error: bool = False,
+    simulating: bool = False,
+) -> str:
+    """
+    The control panel: one button per problem that can be introduced by hand (from the decision
+    table in demo_scenarios.py), a "Back to real values" button, and the SMS language chips.
+    Plain HTML <form method="post"> buttons -- no JavaScript. They only work because the
+    dashboard's CSP allows form posts to its own origin (form-action 'self', see main.py).
+
+    Introducing a problem sends a real SMS, so the panel stays locked until the access key has been
+    entered once (main.py then remembers it in a cookie).
+
+    The key box is only shown on request (`show_key_form`: ?unlock=1, or after a wrong key). The
+    page reloads itself every few seconds, which would wipe a key half-typed into an always-present
+    box, so the pages that show the box do not reload.
+    """
+    if not unlocked:
+        device_field = f'<input type="hidden" name="device" value="{escape(device_id)}">' if device_id else ""
+        if show_key_form:
+            # The message sits right above the key box (which is auto-focused, so the browser scrolls
+            # to it): a notice further away would be scrolled out of sight.
+            wrong = (
+                '<div class="notice" role="alert" style="margin:12px 0 0"><b>Incorrect access key.</b> '
+                "Nothing was sent. Enter the access key, not the device name.</div>"
+                if key_error else ""
+            )
+            unlock = (
+                f'{wrong}<form class="unlock" method="get" action="/dashboard">{device_field}'
+                '<input type="password" name="key" placeholder="Access key" aria-label="Access key" '
+                'autocomplete="off" required autofocus>'
+                '<button class="demo-btn" type="submit">Unlock</button></form>'
+            )
+        else:
+            href = "?unlock=1" + (f"&device={quote(device_id, safe='')}" if device_id else "") + "#demo-controls"
+            unlock = f'<a class="demo-btn unlock-link" href="{escape(href)}">Enter access key</a>'
+        return (
+            '<div class="demo-panel" id="demo-controls"><h2 style="margin-top:0">Introduce a problem</h2>'
+            '<p class="demo-locked">Enter the access key to unlock buttons that introduce a problem (and send '
+            "its SMS) so you can show every alert on demand, and to change the SMS language.</p>"
+            f"{unlock}</div>"
+        )
+
+    pills = ""
+    for name, s in demo_scenarios.get_button_scenarios().items():
+        action = f"/demo/scenario/{quote(name, safe='')}?back=dashboard"
+        pills += (
+            f'<form method="post" action="{escape(action)}">'
+            f'<button class="pill" type="submit" title="{escape(s["why_it_matters"])}">{escape(s["title"])}</button></form>'
+        )
+    back = (
+        f'<form method="post" action="/demo/reset?back=dashboard"><button class="pill{" primary" if simulating else ""}" '
+        'type="submit">&#8634; Back to real values</button></form>'
+    )
+    lock = '<form method="post" action="/dashboard/lock"><button class="pill quiet" type="submit">Lock</button></form>'
+    return (
+        '<div class="demo-panel" id="demo-controls">'
+        '<div class="panel-head"><h2>Introduce a problem <span class="hint">each button sends an SMS</span></h2>'
+        f'<div class="panel-actions">{back}{lock}</div></div>'
+        f'<div class="pill-row">{pills}</div>'
+        f"{_language_row(unlocked, device_id)}</div>"
+    )
+
+
+def _simulation_notice(unlocked: bool) -> str:
+    """Shown on a simulated device's page: makes clear these readings are made up, and how to get back."""
+    if unlocked:
+        back = (
+            '<form method="post" action="/demo/reset?back=dashboard">'
+            '<button class="pill primary" type="submit">&#8634; Back to real values</button></form>'
+        )
+    else:
+        back = '<a class="pill primary" href="/dashboard">Back to real values</a>'
+    return (
+        '<div class="sim-notice" role="status"><span><b>Simulated problem.</b> These readings are made up '
+        f"for the demo &mdash; they are not from the field sensor.</span>{back}</div>"
+    )
+
+
+def _device_nav(device_ids: list, selected: str) -> str:
+    # Each introduced problem leaves a DEMO-* device behind. They are not real devices: keep them out of
+    # the switcher, and on their own page the "Back to real values" button replaces it.
+    if selected and selected.startswith("DEMO"):
+        return ""
+    device_ids = [d for d in device_ids if not d.startswith("DEMO")]
     if len(device_ids) < 2:
         return ""
-    chips = ""
-    for did in device_ids:
-        snap = get_snapshot(did)
-        ts = _parse_time(snap.get("updated_at"))
-        stale = ts is not None and (now - ts).total_seconds() > STALE_AFTER_SECONDS
-        level = _overall_status(snap.get("alert_codes", []), stale)[0]
-        current = ' aria-current="page"' if did == selected else ""
-        chips += (
-            f'<a class="chip" href="?device={quote(did, safe="")}"{current}>'
-            f'<span class="dot {level}"></span>{_e(did)}</a>'
-        )
-    return f'<nav class="devices" aria-label="Devices">{chips}</nav>'
+    links = []
+    for d in device_ids:
+        current = ' aria-current="page"' if d == selected else ""
+        links.append(f'<a href="?device={quote(d, safe="")}"{current}>{escape(d)}</a>')
+    return f'<nav class="devices" aria-label="Devices">{"".join(links)}</nav>'
 
 
-def _page(body: str) -> str:
+def _empty_body(notice: str) -> str:
     return (
-        '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">'
-        '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">'
-        f'<title>Crop Advisory Dashboard</title><style>{_CSS}</style></head>'
-        f'<body><div class="wrap">{body}</div><script>{_JS}</script></body></html>'
+        f"{notice}<h2>Waiting for the first sensor reading</h2>"
+        "<p>Nothing has been received yet. Power on the field node; its first reading appears "
+        "here within a few seconds.</p>"
     )
 
 
-def _header(subtitle: str, right: str = "") -> str:
-    return (
-        f'<header><div><h1>VOICE-FIRST CROP ADVISORY</h1><p class="subtitle">{subtitle}</p></div>{right}</header>'
-    )
-
-
-# ---------------------------------------------------------------- entry point
-
-def render_dashboard(device_id: str = None, now: datetime = None) -> str:
-    now = now or datetime.now()
-    # Only ever look up devices that really exist: get_snapshot() creates state
-    # for an unknown id, so an arbitrary ?device= must never reach it.
-    device_ids = [d for d in get_all_device_ids() if get_snapshot(d)]
-
-    if not device_ids:
-        empty = f"""
-        <div class="empty">
-          <h2>Waiting for the first sensor reading</h2>
-          <p>Nothing has reported yet. Once the ESP32 posts to <code>/sensor-data</code>,
-             this page fills in and refreshes by itself every {REFRESH_SECONDS} seconds.</p>
-          <p>To try the logic without sending any SMS, use <code>/sensor-data-preview</code> in the
-             <a href="/docs">API docs</a>.</p>
-        </div>"""
-        return _page(_header("Paddy advisory") + empty)
-
-    notice = ""
-    if device_id and device_id not in device_ids:
-        notice = (
-            f'<div class="notice">No device called <b>{_e(device_id)}</b> has reported. '
-            f"Showing {_e(device_ids[0])} instead.</div>"
-        )
-    selected = device_id if device_id in device_ids else device_ids[0]
-
-    snapshot = get_snapshot(selected)
-    facts = snapshot.get("facts", {})
-    codes = snapshot.get("alert_codes", [])
-    profile = facts.get("crop_profile") or {}
-
+def _status(snapshot: dict, now: datetime, simulated: bool = False):
+    """(css class, headline, indicator-dot classes, age in seconds, stale?) for one device snapshot."""
+    codes = list(snapshot.get("alert_codes") or [])
     updated = _parse_time(snapshot.get("updated_at"))
-    stale = updated is not None and (now - updated).total_seconds() > STALE_AFTER_SECONDS
-    level, headline, detail = _overall_status(codes, stale)
+    age_seconds = (now - updated).total_seconds() if updated else None
+    # A simulated problem is static by nature (nothing keeps reporting), so it never counts as "no recent data".
+    stale = age_seconds is not None and age_seconds > STALE_AFTER_MINUTES * 60 and not simulated
 
-    place = profile.get("location") or "Bhatkal"
-    crop = (profile.get("crop") or "paddy").title()
-    right = (
-        f'<div class="updated"><span class="live{" off" if stale else ""}"></span>'
-        f"Updated {_time_html(snapshot.get('updated_at'), now)}</div>"
+    severities = {ALERTS.get(c, ("warn", c))[0] for c in codes}
+    if stale:
+        cls, headline = "off", "No recent data"
+    elif "bad" in severities:
+        cls, headline = "bad", "Sensor fault"
+    elif severities & {"warn", "wet"}:
+        cls, headline = "warn", "Attention needed"
+    else:
+        cls, headline = "ok", "All clear"
+    dot = {"off": "live off", "bad": "live bad", "warn": "live warn"}.get(cls, "live")
+    return cls, headline, dot, age_seconds, stale
+
+
+def _snapshot_body(device_id: str, snapshot: dict, now: datetime) -> str:
+    facts = snapshot.get("facts") or {}
+    codes = list(snapshot.get("alert_codes") or [])
+
+    simulated = device_id.startswith("DEMO")
+    cls, headline, dot, age_seconds, stale = _status(snapshot, now, simulated)
+    seen = "Simulated reading" if simulated else (
+        f"Last update {_ago(age_seconds)}" if age_seconds is not None else "Update time unknown"
     )
 
-    temp, hum = facts.get("temperature_c"), facts.get("humidity_percent")
-    rain_now, light = facts.get("rain_detected_now"), facts.get("light_level")
-    dht_note = "DHT22 sensor not responding" if "SENSOR_FAULT_DHT22" in (facts.get("sensor_faults") or []) else ""
-    rain_value = "Yes" if rain_now else "No" if rain_now is False else "Unknown"
-    rain_sub = "Rain sensor is wet" if rain_now else "Rain sensor is dry" if rain_now is False else "No rain-sensor value sent"
+    temp, humidity = _num(facts.get("temperature_c"), ".1f"), _num(facts.get("humidity_percent"), ".0f")
+    dht_fault = "SENSOR_FAULT_DHT22" in codes
+    rain_now = facts.get("rain_detected_now")
+    light = _num(facts.get("light_level"), ".0f")
 
-    readings = (
-        _card("Temperature", f"{_fmt(temp, '{:.1f}')}<small>&deg;C</small>" if temp is not None else _fmt(None), dht_note)
-        + _card("Humidity", f"{_fmt(hum)}<small>%</small>" if hum is not None else _fmt(None), dht_note)
-        + _card("Rain right now", rain_value, rain_sub)
-        + _card("Ambient light", f"{_fmt(light)}<small>/ 100</small>" if light is not None else _fmt(None), "Informational only")
+    days = facts.get("days_since_sowing")
+    if isinstance(days, int):
+        maturity = (facts.get("crop_profile") or CROP_PROFILE).get("maturity_days", CROP_PROFILE["maturity_days"])
+        crop = f'<div class="value">Day {days}</div><div class="sub">{escape(_stage_summary(days, maturity))}</div>'
+    else:
+        crop = _na()
+
+    light_html = (
+        f'<div class="value">{light} <span class="na">/ 100</span></div>'
+        if light is not None else _na()
     )
     cards = (
         _moisture_card(facts)
-        + f'<div class="grid">{readings}</div>'
-        + f'<div class="grid2">{_crop_card(facts)}<div class="stack">{_weather_card(facts)}{_mandi_card(facts)}</div></div>'
+        + _dht_card("Temperature", f"{temp} &deg;C" if temp is not None else None, dht_fault)
+        + _dht_card("Humidity", f"{humidity} %" if humidity is not None else None, dht_fault)
+        + f'<div class="card"><div class="label">Rain right now</div><div class="value">'
+          f'{"Yes" if rain_now else "No" if rain_now is False else "Unknown"}</div></div>'
+        + _weather_card(facts, codes)
+        + _mandi_card(facts)
+        + f'<div class="card"><div class="label">Crop age</div>{crop}</div>'
+        + f'<div class="card"><div class="label">Ambient light</div>{light_html}'
+          '<div class="sub">informational only</div></div>'
     )
 
-    body = (
-        _header(f"{_e(place)} &middot; {_e(crop)} &middot; refreshes every {REFRESH_SECONDS}s", right)
-        + _device_chips(device_ids, selected, now)
-        + notice
-        + f'<div class="banner {level}" role="status"><span class="dot {level}"></span>'
-          f'<strong>{_e(headline)}</strong><span class="msg">{_e(detail)}</span></div>'
-        + cards
-        + "<h2>Active alerts</h2>"
-        + _alerts_html(codes, facts.get("weather_checked", True))
-        + "<h2>Last advisory sent</h2>"
-        + _delivery_html(snapshot, now)
-        + f'<footer><span>Device: {_e(selected)}</span>'
-          f'<span>Rule version: {_e(facts.get("rule_version", "unknown"))}</span></footer>'
+    return (
+        f'<div class="status {cls}"><span class="{dot}"></span>{headline}</div>'
+        f'<p class="subtitle">{escape(seen)}</p>'
+        f'<div class="grid{" stale" if stale else ""}">{cards}</div>'
+        f"<h2 id=\"active-alerts\">Active alerts</h2>{_alerts_section(codes)}"
+        f"{_delivery_section(snapshot, now)}"
+        f'<p class="muted">Rule version: {escape(str(facts.get("rule_version", "unknown")))} '
+        f"&middot; Device: {escape(device_id)}</p>"
     )
-    return _page(body)
+
+
+def _default_device(device_ids: list) -> str:
+    """
+    The device to show when none is chosen: the most recently updated REAL device,
+    not just whichever reported first. Otherwise a DEMO-* device that happened to
+    report first (a demo button, or an early reading after a restart) would be shown
+    as if it were the live field node, with old numbers.
+    """
+    real = [d for d in device_ids if not d.startswith("DEMO")]
+    pool = real or device_ids
+    return max(pool, key=lambda d: (get_snapshot(d) or {}).get("updated_at") or "")
+
+
+def render_dashboard(
+    device_id: str = None,
+    now: datetime = None,
+    key: str = None,
+    key_error: bool = False,
+    unlock: bool = False,
+    unlocked: bool = False,
+) -> str:
+    now = now or datetime.now()
+    unlocked = unlocked or bool(key)          # `key` (the older way of passing it) also means unlocked
+    device_ids = get_dashboard_device_ids()
+
+    notice = ""
+    if device_id and device_id not in device_ids:
+        notice += (
+            f'<div class="notice">No device called <b>{escape(device_id)}</b> has reported. '
+            "Showing the default device instead.</div>"
+        )
+        device_id = None
+    if not device_id and device_ids:
+        device_id = _default_device(device_ids)
+
+    snapshot = get_snapshot(device_id) if device_id else None
+    simulating = bool(snapshot) and device_id.startswith("DEMO")
+    banner = _sms_banner(get_last_sms_event(), now)
+
+    # While the key box is showing (?unlock=1, or after a wrong key) the page must NOT reload itself:
+    # a reload every 15 s would wipe whatever is being typed into it.
+    show_key_form = (unlock or key_error) and not unlocked
+    panel = _demo_panel(unlocked, device_id, show_key_form=show_key_form, key_error=key_error, simulating=simulating)
+    auto_refresh = "" if show_key_form else f'<meta http-equiv="refresh" content="{REFRESH_SECONDS}">' + "\n"
+
+    # controls first (what you operate), then the notification, then the readings
+    if snapshot:
+        body = (
+            panel + banner + (_simulation_notice(unlocked) if simulating else "") + notice
+            + _device_nav(device_ids, device_id) + _snapshot_body(device_id, snapshot, now)
+        )
+        _, status_label, status_dot, _, _ = _status(snapshot, now, simulating)
+        if simulating:
+            status_label = "Simulated problem"
+    else:
+        body = panel + banner + _empty_body(notice)
+        status_label, status_dot = "Waiting for data", "live off"
+    crop = str(CROP_PROFILE.get("crop", "crop")).capitalize()
+
+    # Manual refresh keeps the device being viewed.
+    refresh_href = f"?device={quote(device_id, safe='')}" if device_id else "?"
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+{auto_refresh}<title>Crop Advisory - Dashboard</title>
+<style>{CSS}</style>
+</head>
+<body>
+<div class="app-shell">
+  <main class="workspace">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">Field intelligence</p>
+        <h1>Crop Advisory Dashboard</h1>
+        <p class="subtitle">{escape(LOCATION_NAME)} &middot; {escape(crop)} &middot; updates every {REFRESH_SECONDS}s
+          <a class="refresh-btn" href="{escape(refresh_href)}">Refresh</a></p>
+      </div>
+      <div class="topbar-meta"><span class="{status_dot}"></span><span><strong>Field monitor</strong>{escape(status_label)}</span></div>
+    </header>
+    <section class="content" id="field-status">
+      {body}
+    </section>
+  </main>
+</div>
+</body>
+</html>
+"""

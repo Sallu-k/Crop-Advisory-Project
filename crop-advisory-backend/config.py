@@ -9,9 +9,20 @@ environment settings. If a key is missing, the relevant feature degrades
 gracefully (see weather.py / mandi.py) rather than the app crashing.
 """
 import os
+import time
+from datetime import datetime
+
 from dotenv import load_dotenv
 
 load_dotenv()  # reads .env file if present (does nothing on Render, which is fine)
+
+# Hosting platforms (e.g. Render) run in UTC. The SMS "Reading:" time, the crop-age
+# calculation and the "did it rain in the last 6 h" check all use local time, so pin
+# it to India time unless the operator chose one. (time.tzset exists on Linux/macOS
+# only; on Windows the PC's own clock is used, so nothing is changed there.)
+if hasattr(time, "tzset") and not os.getenv("TZ"):
+    os.environ["TZ"] = "Asia/Kolkata"
+    time.tzset()
 
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN", "")
@@ -30,7 +41,7 @@ TEXTBEE_DEVICE_ID = os.getenv("TEXTBEE_DEVICE_ID", "")  # optional; blank uses y
 # The number that actually receives the advisory, regardless of provider.
 # Falls back to TWILIO_TO_NUMBER if not set separately, so your existing
 # .env keeps working with zero changes even if you only set that one.
-ADVISORY_TO_NUMBER = os.getenv("ADVISORY_TO_NUMBER", TWILIO_TO_NUMBER)
+ADVISORY_TO_NUMBER = os.getenv("ADVISORY_TO_NUMBER", "").strip() or TWILIO_TO_NUMBER
 
 # Voice + language for the phone call. Defaults to an English Indian voice.
 # For a Kannada demo, switch to a supported Google Kannada voice, e.g.:
@@ -63,10 +74,34 @@ MANDI_COMMODITY = os.getenv("MANDI_COMMODITY", "Paddy")
 # longer needs NTP time sync just to compute days-since-sowing. Format: YYYY-MM-DD
 SOWING_DATE = os.getenv("SOWING_DATE", "2026-06-15")
 
-# How long (in minutes) to wait before re-alerting on the SAME condition,
-# even if it's still active. Prevents repeated calls every 5 minutes for an
-# unchanged condition. Set low (e.g. 1) only while actively testing.
-ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "720"))  # 12 hours default
+# Fail fast, with a message that says what to fix. A malformed date would otherwise
+# only surface later as an unhandled 500 on every single sensor reading.
+try:
+    datetime.strptime(SOWING_DATE, "%Y-%m-%d")
+except ValueError:
+    raise RuntimeError(
+        f"SOWING_DATE must be in YYYY-MM-DD format (e.g. 2026-06-15), got {SOWING_DATE!r}. "
+        "Fix it in your .env file."
+    ) from None
+
+# SMS timing. A NEW condition (or an error) is always sent immediately. While the
+# same condition keeps being true it is repeated every ALERT_COOLDOWN_MINUTES
+# (moisture, sensor faults, rain warning). A healthy field sends nothing.
+ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "5"))
+
+# Fertilizer and harvest reminders depend only on the calendar and stay true for
+# days (HARVEST_CHECK_DUE for good), so they repeat far less often than the above --
+# otherwise a healthy field would be texted every few minutes forever.
+TIME_BASED_ALERT_COOLDOWN_MINUTES = int(os.getenv("TIME_BASED_ALERT_COOLDOWN_MINUTES", "1440"))  # 24 h
+
+# The dashboard calls a device "No recent data" when nothing has arrived for this
+# many minutes. The ESP32 reports every 15 seconds; raise this if you raise its interval.
+STALE_AFTER_MINUTES = float(os.getenv("STALE_AFTER_MINUTES", "2"))
+
+# Set to "true" when the server is reachable from the internet (a domain). It then
+# refuses to start with a weak/empty EXPECTED_DEVICE_KEY, hides /docs, and requires
+# the key on /sensor-data-preview. Leave off for a prototype on your own Wi-Fi.
+PUBLIC_MODE = os.getenv("PUBLIC_MODE", "false").strip().lower() == "true"
 
 # Voice calling is fully implemented (see telephony.py + llm.py) but disabled
 # by default -- SMS alone is simpler to demo reliably and avoids voice/
@@ -74,3 +109,10 @@ ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "720"))  # 12 h
 # changes needed. When disabled, the Gemini call for voice-message
 # generation is skipped entirely too, not just the phone call.
 ENABLE_VOICE_CALL = os.getenv("ENABLE_VOICE_CALL", "false").lower() == "true"
+
+# Default language of the SMS: "en" (English, also used when blank), "hi"
+# (Hindi) or "kn" (Kannada). The wording comes from built-in templates
+# (sms_i18n.py) -- nothing is machine-translated. The dashboard can override
+# this at runtime (SMS language chips); that choice lasts until the server
+# restarts, after which this value is used again.
+TRANSLATE_SMS_TO = os.getenv("TRANSLATE_SMS_TO", "").strip().lower()

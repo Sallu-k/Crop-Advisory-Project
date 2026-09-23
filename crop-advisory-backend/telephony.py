@@ -10,7 +10,6 @@ from config import (
     TWILIO_ACCOUNT_SID,
     TWILIO_AUTH_TOKEN,
     TWILIO_FROM_NUMBER,
-    TWILIO_TO_NUMBER,
     TWILIO_VOICE,
     TWILIO_VOICE_LANGUAGE,
     SMS_PROVIDER,
@@ -22,6 +21,15 @@ from config import (
 TWILIO_BASE_URL = f"https://api.twilio.com/2010-04-01/Accounts/{TWILIO_ACCOUNT_SID}"
 TEXTBEE_SEND_URL = "https://api.textbee.dev/api/v1/gateway/send-sms"
 REQUEST_TIMEOUT_SECONDS = 15
+
+
+def _json_or_raw(response) -> dict:
+    """Parse a JSON body, tolerating a non-JSON one (a 2xx must not be reported as a failure for that)."""
+    try:
+        body = response.json()
+        return body if isinstance(body, dict) else {"raw": body}
+    except Exception:
+        return {"raw": getattr(response, "text", "")}
 
 
 def send_sms(message: str) -> dict:
@@ -36,7 +44,7 @@ def _send_sms_twilio(message: str) -> dict:
         url = f"{TWILIO_BASE_URL}/Messages.json"
         payload = {
             "From": TWILIO_FROM_NUMBER,
-            "To": TWILIO_TO_NUMBER,
+            "To": ADVISORY_TO_NUMBER,
             "Body": message,
         }
         response = requests.post(
@@ -45,7 +53,7 @@ def _send_sms_twilio(message: str) -> dict:
             auth=HTTPBasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        body = response.json()
+        body = _json_or_raw(response)
         success = response.status_code < 300
         result = {"success": success, "status_code": response.status_code, "body": body}
         if not success:
@@ -110,7 +118,7 @@ def make_voice_call(message: str) -> dict:
         url = f"{TWILIO_BASE_URL}/Calls.json"
         payload = {
             "From": TWILIO_FROM_NUMBER,
-            "To": TWILIO_TO_NUMBER,
+            "To": ADVISORY_TO_NUMBER,
             "Twiml": twiml,
         }
         response = requests.post(
@@ -119,7 +127,7 @@ def make_voice_call(message: str) -> dict:
             auth=HTTPBasicAuth(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN),
             timeout=REQUEST_TIMEOUT_SECONDS,
         )
-        body = response.json()
+        body = _json_or_raw(response)
         success = response.status_code < 300
         result = {"success": success, "status_code": response.status_code, "body": body}
         if not success:

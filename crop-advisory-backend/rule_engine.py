@@ -50,15 +50,13 @@ def _moisture_state(soil_moisture: float, previous_state: str) -> str:
     Hysteresis-based state machine for soil moisture.
     previous_state is one of: "low", "normal", "high" (or None on first read).
     """
-    if previous_state == "low":
-        if soil_moisture >= MOISTURE_LOW_EXIT:
-            return "normal"
-        return "low"
-    if previous_state == "high":
-        if soil_moisture <= MOISTURE_HIGH_EXIT:
-            return "normal"
+    if previous_state == "low" and soil_moisture < MOISTURE_LOW_EXIT:
+        return "low"      # held by hysteresis until the reading rises past the EXIT point
+    if previous_state == "high" and soil_moisture > MOISTURE_HIGH_EXIT:
         return "high"
-    # previous_state is "normal" or unknown -- use the enter thresholds
+    # Not held by hysteresis (normal, unknown, or just released): classify against the
+    # ENTER thresholds. This also catches a jump straight from one extreme past the
+    # other (e.g. "low" -> 90), which must read "high", not "normal".
     if soil_moisture < MOISTURE_LOW_ENTER:
         return "low"
     if soil_moisture > MOISTURE_HIGH_ENTER:
@@ -94,6 +92,7 @@ def evaluate(
     weather: dict = None,   # {"available": bool, "rain_expected": bool or None, "forecast": [...]}
     mandi: dict = None,     # {"available": bool, "modal_price": float, "market": str, ...}
     light_level=None,       # float or None -- ambient light index (LDR). Informational only, never gates an alert.
+    recent_rainfall: dict = None,  # {"available": bool, "rained_recently": bool or None} -- observed, not forecast
 ) -> dict:
     """
     Main entry point. Returns:
@@ -141,8 +140,25 @@ def evaluate(
         rain_expected = weather.get("rain_expected")
         if rain_expected and (harvest["harvest_check_due"] or harvest["harvest_approaching"]):
             alert_codes.append("RAIN_WARNING")
-    else:
+    elif weather is not None:
+        # The forecast was requested and failed. If it was never requested
+        # (weather=None -- e.g. a reading with no new alert, so nothing needed it),
+        # that is "not checked", which is NOT an outage and must not be reported as one.
         alert_codes.append("WEATHER_UNAVAILABLE")
+
+    # ---- Rain vs. irrigation cross-verification ----
+    # When the field is wet (EXCESS_MOISTURE), it matters WHY: a farmer who
+    # just irrigated needs to know they may be overwatering; a field wet from
+    # real rain needs no such warning. We only claim an answer when the
+    # weather service actually confirms it either way -- an unavailable
+    # check is reported as "unknown", never silently assumed to be irrigation
+    # (that would be guessing, and could wrongly scold a farmer for rain).
+    moisture_source = None
+    if moisture_state == "high":
+        if recent_rainfall and recent_rainfall.get("available"):
+            moisture_source = "rain" if recent_rainfall.get("rained_recently") else "irrigation"
+        else:
+            moisture_source = "unknown"
 
     facts = {
         "rule_version": RULE_VERSION,
@@ -157,6 +173,8 @@ def evaluate(
         "sensor_faults": sensor_faults,
 
         "rain_detected_now": raining,           # from the physical rain sensor (None = not sent / unknown)
+        "moisture_source": moisture_source,     # "rain" / "irrigation" / "unknown" / None -- only set when moisture_state == "high"
+        "weather_checked": weather is not None,     # False = never fetched for this reading (not an outage)
         "weather_available": weather_available,
         "rain_expected_next_days": rain_expected,   # True / False / None (None = unknown, NOT "no rain")
         "weather_forecast": (weather or {}).get("forecast"),
