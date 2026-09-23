@@ -14,6 +14,7 @@ for a specific variety or field.
 | FERT-PANICLE | Second N top-dressing | days 40–50 after sowing | ICAR Kharif Agro-Advisory 2025 (split nitrogen application guidance) | Adapted from general guidance, not variety-specific |
 | MATURITY-DAYS | Days to maturity | 115 days (default demo value) | General Kharif paddy range; ICAR documents specific coastal-Karnataka varieties (e.g. Sahyadri Panchamukhi) at 130–135 days | **Not verified for the actual variety grown in Bhatkal — must be corrected before real use** |
 | HARVEST-CHECK | Harvest decision rule | "check due" at day ≥ maturity_days, not an automatic "ready" command | General guidance that grain color/moisture (commonly ~80–85% grains turned golden) is the real harvest signal | System flags a *check window*, not a harvest command — final call is the farmer's |
+| RAIN-VS-IRRIGATION | Observed-rainfall threshold to attribute high moisture to rain vs. irrigation | ≥2.0mm summed over the trailing 6 hours (Open-Meteo observed/reanalysis data, not forecast) | Round-number engineering threshold, not an agronomic citation | Illustrative — a genuinely light drizzle below this threshold would be attributed to irrigation; tune `RECENT_RAIN_THRESHOLD_MM` in `weather.py` if this proves too strict/loose in the field |
 
 ## Prototype-status disclaimer (state this once, not repeatedly)
 

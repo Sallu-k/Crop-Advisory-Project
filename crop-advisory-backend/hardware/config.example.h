@@ -13,9 +13,13 @@
 #define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
 
 // ---- Backend endpoint ----
-// Use your local backend while testing (e.g. http://192.168.1.x:8000/sensor-data),
-// then switch to your deployed Render URL once that's live, e.g.:
-// "https://crop-advisory-backend-xxxx.onrender.com/sensor-data"
+// Use your local backend while testing (e.g. http://192.168.1.x:8000/sensor-data --
+// the IPv4 address of the PC running the server, on the same Wi-Fi as the ESP32),
+// then switch to your hosted domain once that's live, e.g.:
+// "https://crop-advisory-backend-xxxx.onrender.com/sensor-data" or "https://advisory.example.com/sensor-data"
+// https:// is handled by the sketch (it encrypts but does not verify the certificate; see
+// crop_advisory_node.ino). Write the https:// address directly: an http:// address that the
+// host redirects to https will fail.
 #define BACKEND_URL     "https://YOUR-RENDER-APP.onrender.com/sensor-data"
 
 // ---- Device identity ----
@@ -35,7 +39,7 @@
 #define LDR_PIN         32     // LM393 LDR module AOUT (ADC1_4)
 
 // ---- Reading interval ----
-#define READING_INTERVAL_MS   (5UL * 60UL * 1000UL)   // 5 minutes; lower this for live demo testing
+#define READING_INTERVAL_MS   (15UL * 1000UL)   // 15 seconds start-to-start; use 5+ minutes for long-term field use
 
 // ---- FC-28 soil moisture calibration ----
 // Raw ADC values from YOUR sensor in fully dry air vs. fully in water.

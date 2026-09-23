@@ -248,3 +248,58 @@ def test_sms_weather_unavailable_shown_once():
 
 def test_sms_unknown_alert_code_falls_back_to_the_code_itself():
     assert "- SOMETHING_NEW" in message_planner.build_sms_message(["SOMETHING_NEW"], _facts())
+
+
+# ------------------------------------------------- SMS templates: en / hi / kn
+
+import sms_i18n  # noqa: E402
+
+
+@pytest.mark.parametrize("lang", ["hi", "kn"])
+def test_every_actionable_code_has_a_translation(lang):
+    import state_manager
+    missing = (state_manager.ACTIONABLE_CODES | {"WEATHER_UNAVAILABLE"}) - set(sms_i18n.ALERTS[lang])
+    assert not missing, f"{lang}: alert codes without a translation: {missing}"
+
+
+def test_every_language_defines_the_same_template_keys():
+    reference = set(sms_i18n.STRINGS["en"])
+    for lang, table in sms_i18n.STRINGS.items():
+        assert set(table) == reference, f"{lang} template keys differ from English"
+
+
+@pytest.mark.parametrize("lang", ["en", "hi", "kn"])
+def test_sms_in_every_language_carries_the_same_numbers(lang):
+    sms = message_planner.build_sms_message(["LOW_MOISTURE"], _facts(), lang=lang)
+    for expected in ("20/100", "29.5", "68%", "v-test"):
+        assert expected in sms
+
+
+@pytest.mark.parametrize("lang", ["hi", "kn"])
+def test_indic_sms_uses_the_translated_alert_text(lang):
+    sms = message_planner.build_sms_message(["LOW_MOISTURE"], _facts(), lang=lang)
+    assert sms_i18n.ALERTS[lang]["LOW_MOISTURE"] in sms
+    assert llm.ALERT_CODE_DESCRIPTIONS["LOW_MOISTURE"] not in sms
+
+
+def test_indic_sms_unknown_code_falls_back_to_english_then_the_code():
+    assert "- SOMETHING_NEW" in message_planner.build_sms_message(["SOMETHING_NEW"], _facts(), lang="kn")
+
+
+def test_english_sms_is_unchanged_without_a_reading_time():
+    sms = message_planner.build_sms_message(["LOW_MOISTURE"], _facts())
+    assert sms.startswith("CROP ADVISORY - Paddy\nSoil moisture index: 20/100\n")
+    assert "Reading:" not in sms
+
+
+def test_sms_reading_time_is_formatted_from_the_given_moment():
+    from datetime import datetime
+    sms = message_planner.build_sms_message(["LOW_MOISTURE"], _facts(), reading_time=datetime(2026, 9, 21, 14, 5))
+    assert "Reading: 21-Sep 14:05" in sms.split("\n")[1]
+
+
+def test_unsupported_language_falls_back_to_english():
+    assert sms_i18n.normalize_language("fr") == "en"
+    assert sms_i18n.normalize_language(None) == "en"
+    assert sms_i18n.normalize_language(" KN ") == "kn"
+    assert not sms_i18n.is_supported("fr")

@@ -15,8 +15,9 @@
 | `block_diagram.svg` | System-level architecture |
 | `flow_diagram.svg` | Firmware logic flowchart — matches `crop_advisory_node.ino` exactly |
 | `circuit_diagram.svg` | Wiring diagram for your exact 4 modules |
-| `config.example.h` | Template — copy to `config.h` and fill in your real values |
-| `crop_advisory_node.ino` | Main firmware |
+| `config.example.h` | Template — copy to `crop_advisory_node/config.h` and fill in your real values |
+| `crop_advisory_node/` | **The main firmware** (`crop_advisory_node.ino` + its `config.h`). Arduino IDE needs the sketch inside a folder of the same name, so open the `.ino` from here |
+| `_stale_duplicates/` | Old copies of the sketch/config that no longer match the firmware. Ignore (safe to delete) |
 | `analog_sensor_calibration.ino` | Run this first — calibrates soil, rain, and LDR together in one pass |
 
 ## Step-by-step: what to do right now
@@ -81,19 +82,20 @@ affects the raw analog range.
 
 ### Step 5 — Create and fill in config.h
 
-1. Copy `config.example.h`, rename the copy to `config.h`.
+1. Copy `config.example.h` to `crop_advisory_node/config.h` (next to the `.ino`).
 2. Fill in:
    - `WIFI_SSID` / `WIFI_PASSWORD`
-   - `BACKEND_URL` (your deployed Render URL + `/sensor-data`)
+   - `BACKEND_URL` — for local testing `http://<your PC's IPv4>:8000/sensor-data`
+     (start the server with `start_server.bat`); once deployed, your Render URL + `/sensor-data`
    - `DEVICE_ID` / `DEVICE_KEY` (must match your backend's `.env`)
    - All five calibration values from Step 4
 
-`config.h` is gitignored — your real Wi-Fi password and device key never
-get committed.
+`crop_advisory_node/config.h` is gitignored — your real Wi-Fi password and
+device key never get committed.
 
 ### Step 6 — Upload and test the main firmware
 
-1. Open `crop_advisory_node.ino` (with `config.h` in the same folder —
+1. Open `crop_advisory_node/crop_advisory_node.ino` (with `config.h` in the same folder —
    Arduino IDE shows both as tabs).
 2. Upload to your ESP32.
 3. Open Serial Monitor at `115200` baud. You should see it connect to

@@ -24,6 +24,9 @@ KEY = {"X-Device-Key": "test-key"}
 def isolated(monkeypatch):
     """Fresh state + deterministic config + all network mocked, for every test."""
     state_manager._STATE_STORE.clear()
+    state_manager.reset_runtime()
+    client.cookies.clear()          # the dashboard remembers the access key in a cookie: start every test locked
+    monkeypatch.setattr(state_manager, "TRANSLATE_SMS_TO", "")   # whatever .env says: default to English
 
     monkeypatch.setattr(main, "EXPECTED_DEVICE_KEY", "test-key")
     # Day 5 of the crop: no fertilizer / harvest rule fires, so only moisture
@@ -49,10 +52,15 @@ def isolated(monkeypatch):
         lambda: {"available": True, "rain_expected": False, "forecast": []},
     )
     monkeypatch.setattr(main, "get_mandi_price", lambda: {"available": False})
+    monkeypatch.setattr(
+        main, "get_recent_rainfall",
+        lambda: {"available": False, "rained_recently": None, "mm_last_6h": None},
+    )
     monkeypatch.setattr(main, "build_voice_message", lambda codes: "VOICE:" + ",".join(codes))
 
     yield calls
     state_manager._STATE_STORE.clear()
+    state_manager.reset_runtime()
 
 
 client = TestClient(main.app)
@@ -287,3 +295,238 @@ def test_mandi_alone_never_triggers_a_message(monkeypatch, isolated):
 
 
 # The dashboard's rendering is covered in tests/test_dashboard.py.
+
+
+# --------------------------------------- rain-vs-irrigation cross-verification
+
+def test_excess_moisture_confirmed_as_rain(monkeypatch, isolated):
+    monkeypatch.setattr(
+        main, "get_recent_rainfall",
+        lambda: {"available": True, "rained_recently": True, "mm_last_6h": 12.4},
+    )
+    body = client.post("/sensor-data", json=reading(1, 85), headers=KEY).json()
+    assert body["facts"]["moisture_source"] == "rain"
+    assert "recent rainfall" in isolated["sms"][0]
+    assert "irrigation" not in isolated["sms"][0].lower() or "not rain" not in isolated["sms"][0].lower()
+
+
+def test_excess_moisture_attributed_to_irrigation(monkeypatch, isolated):
+    monkeypatch.setattr(
+        main, "get_recent_rainfall",
+        lambda: {"available": True, "rained_recently": False, "mm_last_6h": 0.0},
+    )
+    body = client.post("/sensor-data", json=reading(1, 85), headers=KEY).json()
+    assert body["facts"]["moisture_source"] == "irrigation"
+    assert "irrigation" in isolated["sms"][0].lower()
+    assert "overwatering" in isolated["sms"][0].lower()
+
+
+def test_excess_moisture_unknown_when_weather_check_fails(isolated):
+    # isolated's default get_recent_rainfall mock already returns unavailable.
+    body = client.post("/sensor-data", json=reading(1, 85), headers=KEY).json()
+    assert body["facts"]["moisture_source"] == "unknown"
+    assert "Could not confirm whether this is rain or irrigation" in isolated["sms"][0]
+
+
+def test_recent_rainfall_never_fetched_for_low_moisture(monkeypatch, isolated):
+    """Fetching real (observed) rainfall data only makes sense for EXCESS_MOISTURE."""
+    calls = []
+    monkeypatch.setattr(main, "get_recent_rainfall", lambda: calls.append(1) or {"available": False, "rained_recently": None, "mm_last_6h": None})
+    client.post("/sensor-data", json=reading(1, 15), headers=KEY)  # LOW_MOISTURE, not EXCESS
+    assert calls == []
+
+
+# ------------------------------------------------------- demo scenario endpoints
+
+def test_list_demo_scenarios_matches_the_decision_table():
+    body = client.get("/demo/scenarios").json()
+    assert "low_moisture" in body
+    assert body["low_moisture"]["expected_alert"] == "LOW_MOISTURE"
+    assert body["rain_warning"]["can_force_trigger"] is False
+    assert body["low_moisture"]["can_force_trigger"] is True
+
+
+def test_demo_scenario_requires_device_key(isolated):
+    r = client.post("/demo/scenario/low_moisture")
+    assert r.status_code == 401
+
+
+def test_demo_scenario_accepts_key_via_query_param(isolated):
+    """HTML <form> buttons can't set custom headers without JavaScript."""
+    r = client.post("/demo/scenario/low_moisture?key=test-key")
+    assert r.status_code == 200
+    assert r.json()["expected_alert"] == "LOW_MOISTURE"
+    assert "LOW_MOISTURE" in r.json()["new_alert_codes"]
+
+
+def test_demo_scenario_fires_every_time_like_demo_trigger(isolated):
+    r1 = client.post("/demo/scenario/low_moisture", headers=KEY)
+    r2 = client.post("/demo/scenario/low_moisture", headers=KEY)
+    assert "LOW_MOISTURE" in r1.json()["new_alert_codes"]
+    assert "LOW_MOISTURE" in r2.json()["new_alert_codes"]  # not suppressed by cooldown
+    assert len(isolated["sms"]) == 2
+
+
+def test_demo_scenario_unknown_name_is_404(isolated):
+    r = client.post("/demo/scenario/not_a_real_scenario", headers=KEY)
+    assert r.status_code == 404
+
+
+def test_demo_scenario_rain_warning_cannot_be_force_triggered(isolated):
+    r = client.post("/demo/scenario/rain_warning", headers=KEY)
+    assert r.status_code == 400
+    assert "cannot be force-triggered" in r.json()["detail"]
+
+
+def test_demo_scenario_fertilizer_uses_days_override_not_real_sowing_date(isolated):
+    body = client.post("/demo/scenario/fertilizer_tillering", headers=KEY).json()
+    assert body["days_since_sowing"] == 20
+    assert "FERTILIZER_DUE_TILLERING" in body["new_alert_codes"]
+
+
+def test_demo_scenario_sensor_fault_reports_honestly(isolated):
+    body = client.post("/demo/scenario/sensor_fault_dht", headers=KEY).json()
+    assert "SENSOR_FAULT_DHT22" in body["new_alert_codes"]
+    assert body["facts"]["temperature_c"] is None
+
+
+def test_real_sensor_data_is_never_affected_by_demo_days_override(isolated):
+    """A demo scenario call must not leak its days-override into real readings."""
+    client.post("/demo/scenario/fertilizer_panicle", headers=KEY)  # days_override=45
+    body = client.post("/sensor-data", json=reading(1, 50), headers=KEY).json()
+    assert body["days_since_sowing"] == 5  # from the isolated fixture's real SOWING_DATE
+
+
+# ---------------------------------------------------------------- SMS language
+
+def test_sms_is_english_by_default(isolated):
+    body = client.post("/sensor-data", json=reading(1, 15), headers=KEY).json()
+    assert body["sms_language"] == "en"
+    assert "sms_message_english" not in body
+    assert "Soil moisture index" in body["sms_message"]
+
+
+def test_sms_uses_the_env_default_language(monkeypatch, isolated):
+    monkeypatch.setattr(state_manager, "TRANSLATE_SMS_TO", "kn")
+    body = client.post("/sensor-data", json=reading(1, 15), headers=KEY).json()
+    assert body["sms_language"] == "kn"
+    assert body["sms_message"].startswith("ಬೆಳೆ ಸಲಹೆ")
+    assert body["sms_message_english"].startswith("CROP ADVISORY")
+    assert isolated["sms"][0] == body["sms_message"]  # the Kannada text is what is actually sent
+
+
+def test_unsupported_env_language_falls_back_to_english(monkeypatch, isolated):
+    monkeypatch.setattr(state_manager, "TRANSLATE_SMS_TO", "fr")
+    body = client.post("/sensor-data", json=reading(1, 15), headers=KEY).json()
+    assert body["sms_language"] == "en"
+
+
+@pytest.mark.parametrize("lang", ["hi", "kn"])
+def test_indic_sms_keeps_every_number_as_ascii_digits(lang, isolated):
+    """No translator is involved, so the values can never be altered or rendered in native digits."""
+    client.post(f"/settings/sms-language?lang={lang}", headers=KEY)
+    body = client.post("/sensor-data", json=reading(1, 15.0), headers=KEY).json()
+    sms = body["sms_message"]
+    for expected in ("15/100", "28.0", "60%"):
+        assert expected in sms
+    # neither Devanagari (U+0966-096F) nor Kannada (U+0CE6-0CEF) digits
+    assert not any("०" <= ch <= "९" or "೦" <= ch <= "೯" for ch in sms)
+
+
+def test_sms_carries_the_reading_time(isolated):
+    body = client.post("/sensor-data", json=reading(1, 15), headers=KEY).json()
+    assert "Reading: " in body["sms_message"]
+
+
+def test_set_language_requires_the_device_key(isolated):
+    assert client.post("/settings/sms-language?lang=kn").status_code == 401
+    assert state_manager.get_sms_language() == "en"
+
+
+def test_set_language_rejects_unsupported_codes(isolated):
+    r = client.post("/settings/sms-language?lang=fr", headers=KEY)
+    assert r.status_code == 400
+    assert state_manager.get_sms_language() == "en"
+
+
+def test_set_language_changes_every_following_sms(isolated):
+    r = client.post("/settings/sms-language?lang=hi&key=test-key")
+    assert r.status_code == 200 and r.json() == {"sms_language": "hi"}
+    body = client.post("/sensor-data", json=reading(1, 15), headers=KEY).json()
+    assert body["sms_message"].startswith("फसल सलाह")
+    # a demo button uses the same setting
+    demo = client.post("/demo/scenario/low_moisture", headers=KEY).json()
+    assert demo["sms_language"] == "hi"
+
+
+def test_demo_scenario_lang_param_overrides_for_one_call(isolated):
+    body = client.post("/demo/scenario/low_moisture?lang=kn", headers=KEY).json()
+    assert body["sms_language"] == "kn"
+    assert state_manager.get_sms_language() == "en"     # the saved setting is untouched
+    assert client.post("/demo/scenario/low_moisture?lang=fr", headers=KEY).status_code == 400
+
+
+def test_dashboard_form_posts_redirect_back_to_the_dashboard(isolated):
+    r = client.post("/demo/scenario/sensor_fault_dht?key=test-key&back=dashboard&device=FIELD-001",
+                    follow_redirects=False)
+    assert r.status_code == 303
+    # it opens the simulated device's page, where the problem is visible (not the device you were on)
+    assert r.headers["location"] == "/dashboard?device=DEMO-SENSOR_FAULT_DHT"
+    assert len(isolated["sms"]) == 1                    # and the SMS really was sent
+
+    r = client.post("/settings/sms-language?lang=kn&key=test-key&back=dashboard&device=FIELD-001", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/dashboard?device=FIELD-001"      # the access key is not put in the URL
+
+
+# ------------------------------------------------------- last-SMS outcome (dashboard banner)
+
+def test_sms_event_recorded_on_success(isolated):
+    client.post("/demo/scenario/sensor_fault_dht", headers=KEY)
+    event = state_manager.get_last_sms_event()
+    assert event["ok"] is True and event["error"] is None
+    assert event["device_id"] == "DEMO-SENSOR_FAULT_DHT"
+    assert event["message"] == isolated["sms"][0]
+
+
+def test_sms_event_recorded_on_failure(monkeypatch, isolated):
+    monkeypatch.setattr(main, "send_sms", lambda m: {"success": False, "error": "textbee 401: bad key"})
+    client.post("/demo/scenario/sensor_fault_dht", headers=KEY)
+    event = state_manager.get_last_sms_event()
+    assert event["ok"] is False and event["error"] == "textbee 401: bad key"
+
+
+def test_no_sms_event_when_nothing_was_sent(isolated):
+    client.post("/sensor-data", json=reading(1, 50), headers=KEY)    # nothing to alert on
+    assert state_manager.get_last_sms_event() is None
+
+
+# --------------------------------------------------------------- dashboard CSP
+
+def test_dashboard_csp_allows_its_own_form_posts():
+    csp = client.get("/dashboard").headers["content-security-policy"]
+    assert "form-action 'self'" in csp
+    assert "form-action 'none'" not in csp
+
+
+# -------------------------------------------------- wrong key from a dashboard button
+
+def test_wrong_key_from_a_dashboard_button_goes_back_with_a_message_and_sends_nothing(isolated):
+    r = client.post("/demo/scenario/sensor_fault_dht?key=FIELD-001&back=dashboard&device=FIELD-001",
+                    follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/dashboard?device=FIELD-001&error=key#demo-controls"   # the wrong key is dropped
+    assert isolated["sms"] == []
+    assert state_manager.get_last_sms_event() is None
+
+
+def test_wrong_key_from_a_language_chip_goes_back_and_changes_nothing(isolated):
+    r = client.post("/settings/sms-language?lang=kn&key=nope&back=dashboard", follow_redirects=False)
+    assert r.status_code == 303 and r.headers["location"] == "/dashboard?error=key#demo-controls"
+    assert state_manager.get_sms_language() == "en"
+
+
+def test_wrong_key_for_api_callers_is_still_a_plain_401(isolated):
+    assert client.post("/demo/scenario/low_moisture?key=nope").status_code == 401
+    assert client.post("/settings/sms-language?lang=kn&key=nope").status_code == 401
+    assert isolated["sms"] == []
