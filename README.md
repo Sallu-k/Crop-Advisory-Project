@@ -1,328 +1,542 @@
-# Voice-First Crop Advisory System (v2)
+# Crop Advisory IoT System
 
-Full project repo: backend pipeline (this root folder) + ESP32 hardware/firmware
-(in `hardware/`, with its own [hardware/README.md](hardware/README.md) and
-wiring/flow/block diagrams).
+An IoT-based crop advisory platform that combines field sensing, rule-based agricultural decision logic, weather data, market information, and SMS delivery to provide actionable crop advisories.
 
-> **Prototype status:** This is a proof-of-concept. Agronomic thresholds are
-> illustrative and would need validation against the actual paddy variety,
-> local soil conditions, and Bhatkal KVK recommendations before real
-> deployment. See `agronomy/AGRONOMY_SOURCES.md` for exactly which numbers
-> are sourced from where.
+> **Prototype:** This system is a proof-of-concept. Agronomic thresholds require validation against the target crop variety, local soil conditions, and region-specific agricultural recommendations before real-world deployment.
 
-> **Delivery mode:** SMS-only by default. Voice calling is fully implemented
-> and tested (`telephony.py` + `llm.py`) but disabled via a config flag
-> (`ENABLE_VOICE_CALL=false`) to reduce the number of moving parts to
-> rehearse for a live demo. This is a genuine implemented feature behind a
-> switch, not an unbuilt roadmap item — set `ENABLE_VOICE_CALL=true` in
-> `.env` to turn it back on with zero code changes. When disabled, the
-> Gemini call for voice-message generation is skipped entirely too.
+---
 
-## SMS providers: Twilio trial vs. textbee
+## Overview
 
-Twilio trial accounts restrict SMS to predefined templates (error
-`572006`) and unverified recipients — real, documented limitations, not a
-bug in this code. Two ways around it:
+The system connects an ESP32-based field node to a Python backend that processes environmental readings and determines relevant agricultural conditions.
 
-1. **Upgrade Twilio** (pay the small minimum, typically ~$20) — removes
-   both restrictions instantly, no other changes needed.
-2. **Switch to textbee** (free, no restrictions for this use case) — turns
-   an old Android phone into the SMS sender, using its own SIM/carrier
-   plan. Install the app, register at textbee.dev, get an API key, then in
-   `.env` set `SMS_PROVIDER=textbee` and `TEXTBEE_API_KEY=...`. No other
-   code changes — `telephony.py` routes to whichever provider is configured.
+The platform is designed around a simple principle:
 
-## What changed in v2 (responding to a full technical audit)
+**Sense → Validate → Analyse → Advise → Deliver**
 
-The original v1 backend worked, but had a real spam bug and several
-honesty/security gaps. v2 fixes the highest-impact ones:
+Field measurements are evaluated using deterministic, versioned rules. Relevant advisories are then delivered to configured recipients through SMS.
 
-1. **State-change alerting, not every-reading alerting.** A field that stays
-   dry for hours no longer triggers a phone call every 5 minutes — only a
-   *new* condition, or one whose cooldown has expired, triggers delivery.
-   See `state_manager.py`.
-2. **Sensor faults are reported honestly, never faked.** If the DHT22 fails,
-   the system says so (`SENSOR_FAULT_DHT22`) instead of sending a plausible
-   fake temperature/humidity.
-3. **Hysteresis, not a single threshold**, for soil moisture — prevents the
-   system flickering between states when a reading sits near a boundary.
-4. **The LLM only ever sees alert codes, never raw numbers** — it cannot
-   hallucinate a wrong figure because it's never given one. All numeric
-   facts (moisture index, temperature, mandi price) go into the SMS via a
-   deterministic template, never through the LLM.
-5. **"Harvest ready" became "harvest check due"** — a decision-support
-   signal, not a command; the actual call is left to the farmer.
-6. **Weather API failure means "unknown", never "no rain".** Silently
-   turning an API failure into "safe/no" was a real correctness bug.
-7. **Rule versioning + sourcing** — see `agronomy/`.
-8. **Basic security**: a shared device-key header (`X-Device-Key`) so random
-   requests can't trigger a real phone call, plus input-range validation and
-   duplicate-sequence rejection. No API keys are hardcoded in source code
-   anymore (previously a shared data.gov.in demo key was baked in).
-9. **Separate voice (short) and SMS (detailed) messages**, instead of one
-   long message read aloud on both channels.
-10. **A tiny live dashboard** at `/dashboard` for demo day.
+The architecture also includes weather cross-verification, multilingual messaging, delivery management, a monitoring dashboard, and reproducible demonstration scenarios.
 
-## What's new in v3: demo controls, rain-vs-irrigation, translation
+---
 
-11. **One-click demo scenarios (the "decision table")** — `demo_scenarios.py`
-    defines a named, reproducible scenario for every alert the system can
-    raise (low/excess moisture, each fertilizer window, harvest, both
-    sensor faults). `GET /demo/scenarios` lists them; `POST
-    /demo/scenario/{name}` fires one on demand, complete with a real SMS
-    send — so every condition can be shown to a judge without waiting for
-    it to occur naturally. `RAIN_WARNING` is deliberately **not**
-    force-triggerable (see point 12) — faking weather would defeat the
-    point of grounding that alert in real data.
-12. **Rain-vs-irrigation cross-verification** — when `EXCESS_MOISTURE`
-    fires, the backend checks Open-Meteo's *observed* (not forecast)
-    rainfall for the last 6 hours before saying anything. The SMS then
-    says whether the wetness is confirmed rain, likely irrigation, or
-    (if the weather check itself failed) explicitly "unknown" — it never
-    guesses either way. See `weather.get_recent_rainfall()` and the
-    `moisture_source` fact in `rule_engine.py`.
-13. **SMS language (English / Hindi / Kannada)** — the SMS wording comes
-    from built-in templates in `sms_i18n.py`, with every number formatted by
-    plain code, so nothing is translated at send time and a message can never
-    fall back to English or alter a value. `TRANSLATE_SMS_TO` (`en`, `hi` or
-    `kn`) sets the default; the dashboard's language chips (once unlocked with
-    the device key) change it at runtime for both automatic and demo SMS, until
-    the server restarts. Each SMS carries a `Reading:` time, and the dashboard
-    banner shows whether the last SMS was sent or failed, with its full text.
-14. **Dashboard demo panel + manual refresh** — a "Refresh" link next
-    to the auto-refresh, and (once you enter the access key via "Enter access
-    key", or add `?key=YOUR_DEVICE_KEY` to the URL) one
-    button per force-triggerable scenario, plus the SMS language chips. Plain
-    HTML `<form>` buttons, no JavaScript. The dashboard's CSP allows form
-    posts to its own origin only (`form-action 'self'`).
+## System Architecture
 
-## What's in this folder
+```text
+┌──────────────────────┐
+│     ESP32 Node       │
+│                      │
+│ Soil / Environmental │
+│      Sensors         │
+└──────────┬───────────┘
+           │
+           │ HTTP
+           ▼
+┌──────────────────────┐
+│    FastAPI Backend   │
+│                      │
+│ Validation           │
+│ State Management     │
+│ Rule Engine          │
+│ Advisory Generation  │
+└───────┬───────┬──────┘
+        │       │
+        │       ├──────────────► Weather Data
+        │       │
+        │       └──────────────► Mandi Data
+        │
+        ▼
+┌──────────────────────┐
+│   Delivery Layer     │
+│                      │
+│ SMS / Voice          │
+│ Multi-recipient      │
+│ Retry & Backoff      │
+└──────────┬───────────┘
+           │
+           ▼
+     Farmer / Users
 
-| File / folder | What it does |
+           ▲
+           │
+┌──────────┴───────────┐
+│     Web Dashboard    │
+│                      │
+│ Live readings        │
+│ Active alerts        │
+│ Delivery status      │
+│ Demonstration tools  │
+└──────────────────────┘
+```
+
+---
+
+## Key Capabilities
+
+### Deterministic Advisory Engine
+
+Agricultural decisions are generated through versioned rules rather than relying on an LLM to interpret raw sensor values.
+
+The system supports:
+
+- Soil-moisture condition detection
+- Hysteresis-based threshold handling
+- Sensor-fault detection
+- Fertilizer timing advisories
+- Harvest-related decision-support signals
+- Rain-versus-irrigation cross-verification
+- Rule version tracking
+
+### Intelligent Alert Management
+
+The system does not repeatedly notify users for an unchanged condition.
+
+State-change detection and configurable cooldown periods prevent unnecessary SMS delivery while allowing new or persistent conditions to be communicated.
+
+### Sensor Fault Handling
+
+Invalid or unavailable sensor measurements are treated as faults rather than being replaced with fabricated values.
+
+For example, a failed DHT22 reading is represented as a sensor fault instead of generating a plausible temperature or humidity value.
+
+### Weather Cross-Verification
+
+Excess-moisture conditions can be cross-checked against observed rainfall data before generating the advisory.
+
+The system distinguishes between:
+
+- Rain-confirmed moisture
+- Likely irrigation
+- Unknown weather condition
+
+### Multi-recipient Delivery
+
+Advisories can be delivered to multiple configured recipients.
+
+Each recipient has an independent delivery job, allowing retry and backoff handling without one failed recipient blocking other deliveries.
+
+### Multilingual SMS
+
+Built-in SMS templates support:
+
+- English
+- Hindi
+- Kannada
+
+Numeric values are inserted programmatically rather than translated through an LLM.
+
+### Live Monitoring Dashboard
+
+The dashboard provides:
+
+- Latest field readings
+- Active alerts
+- Last SMS status
+- Delivery information
+- Demonstration controls
+- Language selection
+- Simulated advisory scenarios
+
+### Reproducible Demonstration Scenarios
+
+Named demonstration scenarios allow specific advisory conditions to be reproduced without waiting for the corresponding physical condition to occur naturally.
+
+This provides a controlled way to demonstrate the system during presentations and evaluations.
+
+---
+
+## Engineering Approach
+
+A key design decision is separating **agricultural decision logic** from **language generation and message delivery**.
+
+```text
+Sensor Data
+    │
+    ▼
+Validation
+    │
+    ▼
+Rule Engine
+    │
+    ├──► Alert Code
+    │
+    ├──► Rule Version
+    │
+    └──► Supporting Facts
+             │
+             ▼
+      Message Planner
+             │
+        ┌────┴────┐
+        ▼         ▼
+       SMS      Voice
+```
+
+The LLM is not responsible for determining agricultural thresholds or inventing numerical measurements.
+
+This keeps the core advisory path deterministic and auditable.
+
+---
+
+## Technology Stack
+
+### Backend
+
+- Python
+- FastAPI
+- Pydantic
+- Uvicorn
+
+### Embedded
+
+- ESP32
+- Arduino framework
+- Environmental sensors
+- Soil-moisture sensing
+- HTTP communication
+
+### External Services
+
+- Twilio / TextBee for SMS delivery
+- Open-Meteo for weather information
+- data.gov.in for mandi information
+- Gemini for voice-message language rendering
+
+### Testing
+
+- Pytest
+- API tests
+- Rule-engine tests
+- Integration tests
+- Dashboard tests
+- Regression tests
+
+---
+
+## Repository Structure
+
+```text
+crop-advisory-iot-system/
+│
+├── agronomy/
+│   ├── paddy_profile.py
+│   └── AGRONOMY_SOURCES.md
+│
+├── hardware/
+│   ├── crop_advisory_node/
+│   ├── analog_sensor_calibration.ino
+│   ├── soil_calibration.ino
+│   ├── circuit_diagram.svg
+│   ├── block_diagram.svg
+│   └── flow_diagram.svg
+│
+├── repositories/
+│
+├── services/
+│
+├── tests/
+│
+├── main.py
+├── rule_engine.py
+├── state_manager.py
+├── message_planner.py
+├── sms_i18n.py
+├── telephony.py
+├── weather.py
+├── mandi.py
+├── dashboard.py
+├── config.py
+├── database.py / db_models.py
+├── .env.example
+├── requirements.txt
+├── start_server.bat
+├── V5_UPGRADE_GUIDE.md
+└── README.md
+```
+
+---
+
+## Hardware
+
+The field node is based on an ESP32 and communicates sensor readings to the backend over HTTP.
+
+Hardware documentation and diagrams are available in:
+
+```text
+hardware/
+```
+
+This directory contains:
+
+- Firmware
+- Sensor calibration programs
+- Circuit diagram
+- System block diagram
+- System flow diagram
+- Hardware configuration template
+
+Private credentials are intentionally excluded from the repository.
+
+---
+
+## Backend Components
+
+| Component | Responsibility |
 |---|---|
-| `main.py` | FastAPI app — ties everything together, handles auth + dedup |
-| `models.py` | Input validation (range limits, required fields) |
-| `rule_engine.py` | The "brain" — hysteresis, sensor-fault detection, versioned rules, rain-vs-irrigation |
-| `state_manager.py` | State-change + cooldown logic (the anti-spam fix) |
-| `demo_scenarios.py` | The decision table — one named, reproducible scenario per alert code |
-| `message_planner.py` | Builds separate voice (short) vs SMS (detailed) messages |
-| `llm.py` | Gemini calls — voice rendering (alert codes only). Its old SMS-translation helper is kept but no longer used |
-| `sms_i18n.py` | English / Hindi / Kannada SMS wording (built-in templates; numbers are filled in by code) |
-| `telephony.py` | Twilio/textbee SMS + Twilio voice call, independent error handling |
-| `weather.py` | Open-Meteo forecast + observed-rainfall check — "unavailable" is distinct from "no rain" |
-| `mandi.py` | data.gov.in mandi price lookup — full record detail, no hardcoded key |
-| `dashboard.py` | Live-status HTML page with a demo control panel |
-| `config.py` | Loads all settings from `.env` — zero hardcoded credentials |
-| `agronomy/` | Versioned crop rules + `AGRONOMY_SOURCES.md` documenting where every number comes from |
-| `tests/` | 250+ tests across rules, API, dashboard, integrations, and regressions (run with `pytest`) |
+| `main.py` | FastAPI application and request handling |
+| `models.py` | Input validation |
+| `rule_engine.py` | Agricultural decision logic |
+| `state_manager.py` | State-change and cooldown management |
+| `message_planner.py` | Advisory message construction |
+| `sms_i18n.py` | Multilingual SMS templates |
+| `telephony.py` | SMS and voice delivery |
+| `weather.py` | Weather and rainfall data |
+| `mandi.py` | Market-price data |
+| `dashboard.py` | Monitoring and demonstration interface |
+| `config.py` | Environment-based configuration |
+| `agronomy/` | Versioned crop rules and sources |
+| `tests/` | Automated test suite |
 
-## Step 1 — Save the files and install dependencies
+---
+
+## Security
+
+Credentials are not stored directly in the source code.
+
+Runtime configuration is supplied through environment variables and private hardware configuration.
+
+The repository includes:
+
+```text
+.env.example
+hardware/config.example.h
+hardware/crop_advisory_node/config.example.h
+```
+
+while sensitive and local files such as:
+
+```text
+.env
+config.h
+crop_advisory.db
+```
+
+are excluded through `.gitignore`.
+
+Device requests are protected using a shared device key, and incoming data is subject to validation and duplicate-sequence checks.
+
+---
+
+## Getting Started
+
+> Upgrading from v4? See [V5_UPGRADE_GUIDE.md](V5_UPGRADE_GUIDE.md) for exactly what changed.
+> Hardware wiring, calibration and flashing are covered in [hardware/README.md](hardware/README.md).
+
+### Step 1 — Install dependencies
 
 ```bash
 python -m venv venv
 ```
+
 Activate it (`venv\Scripts\activate` on Windows, `source venv/bin/activate` on Mac/Linux), then:
+
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt        # add requirements-dev.txt to run the tests
 ```
 
-## Step 2 — Fill in your `.env`
+### Step 2 — Fill in your `.env`
 
-Copy `.env.example` → rename to `.env` → fill in your real Twilio/Gemini
-keys, `EXPECTED_DEVICE_KEY` (must match your ESP32's `config.h`), and
-`SOWING_DATE`.
+Copy `.env.example` to `.env` and fill in:
 
-## Step 3 — Run the tests (no network needed)
+- Your SMS provider keys (Twilio or textbee, see below) and the Gemini key if voice is on
+- `EXPECTED_DEVICE_KEY`, which must match `DEVICE_KEY` in the ESP32's `config.h`
+- `SOWING_DATE`
+- **Recipients.** `ADVISORY_TO_NUMBER` takes a single number. `ADVISORY_TO_NUMBERS` takes a comma-separated list (`+919876543210,+919812345678`), and each number gets its own delivery job with independent retry/backoff.
+- **Alert cadence.** `ALERT_COOLDOWN_MINUTES` defaults to `360`, so an unchanged condition repeats every 6 hours (about 4 updates a day). For a live demo where you want to see repeats quickly, set it to `5`.
+
+For the ESP32, copy `hardware/crop_advisory_node/config.example.h` to `config.h` in the same folder and fill in the Wi-Fi details, `BACKEND_URL` and `DEVICE_KEY`. `config.h` is git-ignored and must never be committed.
+
+### Step 3 — Run the tests (no network needed)
 
 ```bash
 pytest tests/ -v
 ```
-Every test should pass — they check every threshold (hysteresis
-enter/exit points, fertilizer windows, harvest timing, sensor-fault
-handling), the API, the dashboard and the SMS timing rules without needing
-any real API keys or internet access (nothing here can send an SMS).
 
-## Step 4 — Run the server locally
+Every test should pass. The tests cover every threshold (hysteresis enter/exit points, fertilizer windows, harvest timing, sensor-fault handling), the API, the dashboard, the delivery queue and the SMS timing rules. None of them need real API keys or internet access, and none can send an SMS.
 
-On Windows, double-click **`start_server.bat`** (or run it from a terminal). It
-starts the server with `--host 0.0.0.0`, which is what lets the ESP32 reach it.
-The equivalent command:
+### Step 4 — Run the server locally
+
+On Windows, double-click **`start_server.bat`** or run it from a terminal. It starts the server with `--host 0.0.0.0`, which is what lets the ESP32 reach it. The equivalent command is:
 
 ```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-(Plain `uvicorn main:app` only listens on this PC itself, so an ESP32 could
-never reach it.) Run a single server process: the alert state is kept in memory.
+Plain `uvicorn main:app` only listens on this PC, so an ESP32 could never reach it. Run a single server process.
 
-### Prototype in a room (ESP32 + this PC on one Wi-Fi)
+Device, reading, alert and delivery state is stored in SQLite (`crop_advisory.db`, set by `DATABASE_URL`). It is created on first start, survives restarts and is git-ignored.
 
-1. Put the ESP32 and this PC on the **same Wi-Fi network** (the ESP32 only does 2.4 GHz).
-   School/office networks often isolate devices from each other or use a
-   login page; if the ESP32 can't reach the PC, use a phone hotspot for both.
-2. Find the PC's IPv4 address (`ipconfig` → "IPv4 Address") and put it in
-   `hardware/crop_advisory_node/config.h`:
+#### Prototype in a room (ESP32 + this PC on one Wi-Fi)
+
+1. Put the ESP32 and this PC on the **same Wi-Fi network**. The ESP32 only supports 2.4 GHz. School and office networks often isolate devices from each other or use a login page, so if the ESP32 can't reach the PC, put both on a phone hotspot.
+2. Find the PC's IPv4 address (`ipconfig` → "IPv4 Address") and put it in `hardware/crop_advisory_node/config.h`:
    `#define BACKEND_URL "http://192.168.x.x:8000/sensor-data"`.
-   It can change when the router hands out a new address, so re-check it if
-   readings stop arriving.
-3. Allow the port through Windows Firewall, once, in an **Administrator** terminal:
+   The address can change when the router hands out a new one, so re-check it if readings stop arriving.
+3. Allow the port through Windows Firewall. Do this once, in an **Administrator** terminal:
    ```
    netsh advfirewall firewall add rule name="CropAdvisory8000" dir=in action=allow protocol=TCP localport=8000 profile=any
    ```
-4. Check from a phone on the same Wi-Fi: `http://<PC-IP>:8000/dashboard` should load.
-5. Flash the ESP32. In the Serial Monitor you should see a reading every 15 s,
-   and the dashboard's "Last update" should stay under about 15 s.
+4. From a phone on the same Wi-Fi, open `http://<PC-IP>:8000/dashboard`. The page should load.
+5. Flash the ESP32. The Serial Monitor should show a reading every 15 s, and the dashboard's "Last update" should stay under about 15 s.
 
-**When SMS are sent:** immediately when a condition appears or an error occurs
-(dry soil, too wet, a sensor fault…), then again every
-`ALERT_COOLDOWN_MINUTES` (5) while it lasts. A healthy field sends nothing.
-Fertilizer/harvest reminders repeat at most once a day
-(`TIME_BASED_ALERT_COOLDOWN_MINUTES`). You can also send one on demand with the
-dashboard's demo controls (marked `[TEST]`).
+**When SMS are sent:** a new condition or an error (dry soil, too wet, a sensor fault…) is texted immediately. While the condition lasts, it is texted again every `ALERT_COOLDOWN_MINUTES` (default 360). A healthy field sends nothing. Fertilizer and harvest reminders repeat at most once a day (`TIME_BASED_ALERT_COOLDOWN_MINUTES`). You can also send one on demand from the dashboard's demo controls; those messages are marked `[TEST]`.
 
-## Step 5 — Test the logic freely (costs ZERO SMS/calls)
+### Step 5 — Test the logic freely (costs zero SMS/calls)
 
-Go to `http://127.0.0.1:8000/docs`, find **`POST /sensor-data-preview`**,
-and try different scenarios — no device key needed, never delivers, never
-touches your real device's cooldown state:
+Go to `http://127.0.0.1:8000/docs`, find **`POST /sensor-data-preview`**, and try different scenarios. It needs no device key, never delivers, and never touches your real device's cooldown state:
 
 ```json
 {"device_id": "TEST", "sequence": 1, "soil_moisture": 15, "temperature": 30, "humidity": 65, "raining": false}
 ```
 
-Try soil_moisture values across the hysteresis bands (below 28, 28–35,
-above 75), omit `temperature`/`humidity` to see sensor-fault handling, etc.
+Try soil_moisture values in each hysteresis band (below 28, 28–35, above 75). Omit `temperature`/`humidity` to see sensor-fault handling.
 
-## Step 6 — Confirm real delivery (uses Twilio SMS quota — do sparingly)
+### Step 6 — Confirm real delivery (uses SMS quota, so do it sparingly)
 
 ```
 POST /sensor-data
 ```
-with header `X-Device-Key: <your EXPECTED_DEVICE_KEY>` and a real body.
-Because of the state-change logic, sending the **same** reading twice in a
-row will **not** trigger a second SMS — this is intentional, not a bug.
-To force a fresh demo alert, either change the values enough to cross a
-threshold, or use:
+
+Send it with the header `X-Device-Key: <your EXPECTED_DEVICE_KEY>` and a real body. Sending the **same** reading twice in a row does **not** trigger a second SMS. This is the state-change logic working as intended. To force a fresh alert, either change the values enough to cross a threshold, or use:
+
 ```
 POST /demo/trigger
 ```
-(also requires the `X-Device-Key` header) — a fixed low-moisture scenario
-for a repeatable live demo. By default this sends SMS only (see the
-`ENABLE_VOICE_CALL` note above); it also places a voice call if you've
-turned that on.
 
-## Step 7 — View the dashboard
+This also needs the `X-Device-Key` header. It fires a fixed low-moisture scenario for a repeatable live demo. By default it sends SMS only; it also places a voice call if `ENABLE_VOICE_CALL=true`.
+
+### Step 7 — View the dashboard
 
 ```
 http://127.0.0.1:8000/dashboard
 ```
-Shows the last reading, active alerts, the last SMS (sent or failed, with its
-text) and last delivery status. Auto-refreshes every 15 seconds — good to have
-open during a live demo. Use the "Refresh" link for an immediate manual refresh.
-If the field node stops reporting, the page says "No recent data" after
-`STALE_AFTER_MINUTES` (2) and dims the old numbers.
 
-**Introducing a problem by hand (for a demo):** press **Enter access key** in the
-"Introduce a problem" panel at the top and type your `EXPECTED_DEVICE_KEY` (the
-secret from `.env` — the same value as `DEVICE_KEY` in `config.h`, *not* the
-device name). You only do this once: the browser remembers it (a cookie, not the
-address bar) until you press **Lock** or 12 hours pass.
+The dashboard shows:
 
-- **A problem button** (DHT22 fault, low moisture, fertilizer due, …) makes up a
-  reading with that problem, sends its SMS (marked `[TEST]`) and opens a
-  **simulated** page showing it. The banner says *Problem introduced: … · SMS
-  sent* (or *SMS FAILED* with the reason), and an amber bar reminds you the numbers
-  are made up.
-- **Back to real values** clears the simulation and returns to the real field
-  readings. The real device and its alert state are never touched by any of this.
-- **SMS language** chips (English / हिन्दी / ಕನ್ನಡ) change the language of every SMS.
+- The last reading
+- Active alerts
+- The last SMS, sent or failed, with its full text
+- The last delivery status
 
-The page pauses its auto-refresh while the key box is open so your typing isn't wiped.
+It auto-refreshes every 15 seconds; use the "Refresh" link for an immediate refresh. If the field node stops reporting, after `STALE_AFTER_MINUTES` (2) the page says "No recent data" and dims the old numbers.
 
-**Default SMS language:** set `TRANSLATE_SMS_TO=en`, `hi` or `kn` in `.env` and
-restart the server. The dashboard chips override it until the next restart.
+**Introducing a problem by hand (for a demo):**
 
-**Security note:** putting the key in the URL is fine on your own laptop, but
-never share a dashboard link that contains `?key=...` — rotate
-`EXPECTED_DEVICE_KEY` if one ever leaks.
+1. Press **Enter access key** in the "Introduce a problem" panel.
+2. Type your `EXPECTED_DEVICE_KEY`. This is the secret from `.env`, the same value as `DEVICE_KEY` in `config.h`, *not* the device name. The browser remembers it in a cookie until you press **Lock** or 12 hours pass.
 
-## Step 8 — Host it on a domain (Render) so it can be checked from anywhere
+Once unlocked, the panel offers:
 
-Push to GitHub (never commit `.env` or `config.h`), create a **Web Service** on
-Render, and set:
+- **A problem button** (DHT22 fault, low moisture, fertilizer due, …). It makes up a reading with that problem, sends its SMS marked `[TEST]`, and opens a **simulated** page. The banner reports whether the SMS was sent or failed, and an amber bar reminds you the numbers are made up.
+- **Back to real values**, which returns to the real field readings. The real device and its alert state are never touched.
+- **SMS language** chips (English / हिन्दी / ಕನ್ನಡ). These set the language of every SMS until the server restarts. To change the default, set `TRANSLATE_SMS_TO=en`, `hi` or `kn` in `.env`.
+
+Never share a dashboard link that contains `?key=...`. If one leaks, rotate `EXPECTED_DEVICE_KEY`.
+
+### Step 8 — Host it on a domain (Render)
+
+Push to GitHub (never commit `.env` or `config.h`), create a **Web Service** on Render, and set:
+
 - **Build Command:** `pip install -r requirements.txt`
 - **Start Command:** `uvicorn main:app --host 0.0.0.0 --port $PORT` (one worker only)
 
-Then add these under Render's **Environment** tab (do not upload your `.env`):
+Add these under Render's **Environment** tab. Do not upload your `.env`.
 
 | Variable | Value |
 |---|---|
-| `PUBLIC_MODE` | `true` — refuses to start with a weak key, hides `/docs`, protects the preview endpoint |
+| `PUBLIC_MODE` | `true`. Refuses to start with a weak key, hides `/docs`, and protects the preview endpoint |
 | `EXPECTED_DEVICE_KEY` | a **new long random key**: `python -c "import secrets; print(secrets.token_urlsafe(24))"` |
-| `TZ` | `Asia/Kolkata` (Render runs in UTC; this keeps SMS times and the rain check correct) |
+| `TZ` | `Asia/Kolkata`. Render runs in UTC; this keeps SMS times and the rain check correct |
 | `PYTHON_VERSION` | `3.12.10` |
-| `SMS_PROVIDER`, `TEXTBEE_API_KEY`, `TEXTBEE_DEVICE_ID`, `ADVISORY_TO_NUMBER` | as in your `.env` (textbee works over the internet; the phone just needs data and its SIM) |
+| `SMS_PROVIDER`, `TEXTBEE_API_KEY`, `TEXTBEE_DEVICE_ID` | as in your `.env` |
+| `ADVISORY_TO_NUMBERS` | every number that should be reached, in international format (`+91...`) |
+| `DATABASE_URL` | a Postgres URL (`postgresql+psycopg://...`) or a SQLite path on a persistent disk. Render's default disk is wiped on redeploy |
 | `SOWING_DATE`, `LOCATION_NAME`, `TRANSLATE_SMS_TO`, … | as in your `.env` |
 
-For your own domain, add it under the service's **Custom Domains** and create
-the DNS record Render shows; https is automatic.
+For your own domain, add it under the service's **Custom Domains** and create the DNS record Render shows. HTTPS is automatic.
 
-**Point the ESP32 at it.** In `config.h` set
-`#define BACKEND_URL "https://<your-domain>/sensor-data"` and
-`#define DEVICE_KEY "<the same new key>"`, then re-flash. The sketch handles
-`https://` itself. Use the `https://` address directly (an `http://` address
-that gets redirected will fail). Note that it encrypts the traffic but does not
-verify the server certificate; for that, pin a root certificate with
-`setCACert()`.
+**Point the ESP32 at it.** In `config.h`, set `#define BACKEND_URL "https://<your-domain>/sensor-data"` and `#define DEVICE_KEY "<the same new key>"`, then re-flash. Use the `https://` address directly, because an `http://` address that gets redirected will fail. The sketch encrypts the traffic but does not verify the server certificate; to verify it, pin a root certificate with `setCACert()`.
 
-**What is public.** Anyone with the address can *view* the dashboard (readings,
-alerts, last SMS text). Sending SMS, changing the language and the preview
-endpoint all need the key. Don't share links containing `?key=`. Rotate the key
-(server + `config.h`) if it leaks, and also rotate the textbee key if this
-folder was ever zipped or shared.
+**What is public:** anyone with the address can *view* the dashboard. Sending SMS, changing the language and the preview endpoint all require the key.
 
-**Known limitations (stated honestly):**
-- The state/cooldown store is in-memory. A restart or redeploy resets it, so
-  active alerts are texted again straight away. Render's free tier also
-  sleeps after inactivity: the ESP32's 15 s readings keep it awake, but a
-  cold start takes 30–60 s, so prefer an always-on plan for real use. A real
-  deployment would use a small persistent store (SQLite/Redis); the
-  architecture isolates this in `state_manager.py` so that swap is one file.
-- There is no rate limiting, and no alert if the ESP32 goes silent (the
-  dashboard shows "No recent data", but nothing is texted).
+---
+
+## SMS providers: Twilio vs. textbee
+
+Twilio trial accounts restrict SMS to predefined templates (error `572006`) and verified recipients. These are Twilio's documented limits, not bugs in this code. There are two ways around them:
+
+1. **Upgrade Twilio.** A small minimum payment, typically about $20, removes both restrictions.
+2. **Switch to textbee.** It is free and turns an Android phone into the SMS sender, using its own SIM. Install the app, register at textbee.dev, and in `.env` set `SMS_PROVIDER=textbee` and `TEXTBEE_API_KEY=...`. `telephony.py` routes to whichever provider is configured.
+
+**Voice calls** are fully implemented (`telephony.py` + `llm.py`) but off by default (`ENABLE_VOICE_CALL=false`). Set it to `true` to enable them with no code changes. Gemini only ever receives alert codes, never raw numbers.
+
+---
 
 ## Troubleshooting
 
-- **401 Unauthorized on `/sensor-data`**: check that `X-Device-Key` matches
-  `EXPECTED_DEVICE_KEY` exactly.
-- **No SMS on a repeated reading:** expected — see Step 6.
-- **Gemini call fails silently:** falls back to a deterministic template
-  automatically — check logs for the reason, but delivery still proceeds.
-- **Mandi price shows unavailable:** either `DATA_GOV_API_KEY` isn't set, or
-  that mandi/commodity/date combination has no record today (expected on
-  Sundays/holidays).
+- **401 Unauthorized on `/sensor-data`:** check that `X-Device-Key` matches `EXPECTED_DEVICE_KEY` exactly.
+- **No SMS on a repeated reading:** this is expected; see Step 6 and `ALERT_COOLDOWN_MINUTES`.
+- **Only one of several numbers receives SMS:** use `ADVISORY_TO_NUMBERS` (plural). The server logs a warning at startup for any entry that isn't in `+<country><number>` format.
+- **Gemini call fails:** the system falls back to a deterministic template automatically, and delivery still proceeds. The logs give the reason.
+- **Mandi price shows unavailable:** either `DATA_GOV_API_KEY` isn't set, or there is no record for that mandi/commodity/date today. That is expected on Sundays and holidays.
 
-## For your demo pitch
+---
 
-Don't say "Gemini analyzes the field and tells the farmer what to do." Say:
-"The agricultural decision is produced by deterministic, versioned rules
-(`rule_version` is returned with every response). SMS delivery uses a fully
-deterministic template — no LLM involved at all, so nothing about the
-numbers a farmer sees can be hallucinated. Voice calling is also fully
-built, using Gemini purely as a language-rendering layer that never sees a
-raw number — it's switched off for today's demo to keep the moving parts
-manageable, not because it doesn't work."
+## Demo Guide
 
-A strong live demo sequence:
-1. **Action** — dip the soil sensor in water/dry it out → watch the
-   dashboard change → SMS arrives.
-2. **No-action** — same dry reading again within the next few minutes →
-   dashboard updates, but no second SMS until the 5-minute cooldown ends (the
-   anti-spam fix, visibly proven).
-3. **Failure handling** — unplug the DHT22 → dashboard shows a sensor-fault
-   alert instead of a fake reading.
+The agricultural decision comes from deterministic, versioned rules, and every response returns its `rule_version`. SMS text is built from deterministic templates with no LLM involved, so none of the numbers a farmer sees can be hallucinated.
 
-If a judge asks "why no voice call today?": "Voice is implemented and
-tested — see `ENABLE_VOICE_CALL` in the config — we scoped it off for this
-demo specifically to keep the number of live external dependencies low and
-reliable on stage, not because it's unbuilt."
+A strong live demo sequence (set `ALERT_COOLDOWN_MINUTES=5` first):
+
+1. **Action:** dip the soil sensor in water or dry it out, watch the dashboard change, and the SMS arrives.
+2. **No action:** send the same reading again within a few minutes. The dashboard updates, but no second SMS arrives until the cooldown ends.
+3. **Failure handling:** unplug the DHT22. The dashboard shows a sensor-fault alert instead of a fake reading.
+
+---
+
+## Limitations
+
+This is a prototype and has several known limitations:
+
+- Agricultural thresholds require field validation (see `agronomy/AGRONOMY_SOURCES.md`).
+- Alert and delivery state is persisted in SQLite, but there are no schema migrations yet (`init_db()` is `create_all()`). Alembic is needed before real device history accumulates.
+- The dashboard's SMS-language override lives in memory and resets on restart.
+- Rate limiting is not implemented.
+- Sensor silence shows on the dashboard ("No recent data") but does not trigger an SMS.
+- HTTPS from the ESP32 does not perform certificate pinning.
+
+---
+
+## Project Status
+
+**Current stage:** Functional prototype (v5)
+
+The system currently includes:
+
+- ESP32 field sensing
+- Backend processing
+- Deterministic advisory rules
+- Sensor fault handling
+- Weather cross-verification
+- SMS delivery
+- Multi-recipient delivery
+- Multilingual SMS
+- Live dashboard
+- Demonstration scenarios
+- Automated tests
+
+---
+
+## Authors
+
+Built jointly as a co-authored project. v5 adds multi-recipient delivery and the production alert cadence on top of the shared v1–v4 foundation; see [V5_UPGRADE_GUIDE.md](V5_UPGRADE_GUIDE.md).

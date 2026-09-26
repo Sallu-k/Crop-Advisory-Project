@@ -43,7 +43,7 @@ def isolated(monkeypatch):
     monkeypatch.setattr(delivery_queue, "ENABLE_VOICE_CALL", False)
     monkeypatch.setattr(state_manager, "ALERT_COOLDOWN_MINUTES", 720)
 
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": True, "status_code": 201})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": True, "status_code": 201})
     weather_ok = lambda: {"available": True, "rain_expected": True, "forecast": FORECAST}
     mandi_off = lambda: {"available": False}
     monkeypatch.setattr(delivery_queue, "get_weather", weather_ok)
@@ -210,7 +210,7 @@ def test_delivery_status_survives_the_next_healthy_reading():
 
 
 def test_failed_delivery_is_flagged(monkeypatch):
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "textbee 401: bad key", "retryable": False})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "textbee 401: bad key", "retryable": False})
     post(1, 20)
     html = page()
     assert 'class="tag bad" style="margin:0">failed: textbee 401: bad key<' in html
@@ -449,7 +449,7 @@ def test_banner_confirms_a_sent_sms_with_its_text():
 
 
 def test_banner_flags_a_failed_sms(monkeypatch):
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "textbee 401: bad key", "retryable": False})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "textbee 401: bad key", "retryable": False})
     client.post("/demo/scenario/sensor_fault_dht", headers=KEY)
     html = page()
     assert 'class="sms-banner bad"' in html
@@ -462,7 +462,7 @@ def test_banner_is_absent_before_any_sms():
 
 
 def test_banner_escapes_hostile_content(monkeypatch):
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "<script>alert(1)</script>", "retryable": False})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "<script>alert(1)</script>", "retryable": False})
     client.post("/demo/scenario/sensor_fault_dht", headers=KEY)
     html = page()
     assert "<script>alert(1)</script>" not in html
@@ -654,7 +654,7 @@ def test_introducing_a_problem_shows_it_and_says_so():
 
 
 def test_a_failed_introduced_problem_says_the_sms_failed(monkeypatch):
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "textbee 401: bad key", "retryable": False})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "textbee 401: bad key", "retryable": False})
     client.get("/dashboard?key=test-key")
     html = client.post("/demo/scenario/low_moisture?back=dashboard").text
     assert "Problem introduced: Low soil moisture" in html

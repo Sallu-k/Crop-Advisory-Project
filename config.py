@@ -43,6 +43,15 @@ TEXTBEE_DEVICE_ID = os.getenv("TEXTBEE_DEVICE_ID", "")  # optional; blank uses y
 # .env keeps working with zero changes even if you only set that one.
 ADVISORY_TO_NUMBER = os.getenv("ADVISORY_TO_NUMBER", "").strip() or TWILIO_TO_NUMBER
 
+# v5: a farmer's household often wants more than one phone reached -- the
+# farmer themself plus, say, a son working elsewhere who manages the field
+# remotely. ADVISORY_TO_NUMBERS takes a comma-separated list and fans out one
+# delivery job per recipient (each with its own independent retry/backoff, so
+# one bad number never blocks the others). If unset, this list is just
+# [ADVISORY_TO_NUMBER], so a single-recipient .env keeps working unchanged.
+_extra_numbers = [n.strip() for n in os.getenv("ADVISORY_TO_NUMBERS", "").split(",") if n.strip()]
+ADVISORY_RECIPIENTS = _extra_numbers or ([ADVISORY_TO_NUMBER] if ADVISORY_TO_NUMBER else [])
+
 # Voice + language for the phone call. Defaults to an English Indian voice.
 # For a Kannada demo, switch to a supported Google Kannada voice, e.g.:
 #   TWILIO_VOICE=Google.kn-IN-Standard-A
@@ -87,7 +96,14 @@ except ValueError:
 # SMS timing. A NEW condition (or an error) is always sent immediately. While the
 # same condition keeps being true it is repeated every ALERT_COOLDOWN_MINUTES
 # (moisture, sensor faults, rain warning). A healthy field sends nothing.
-ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "5"))
+#
+# v5: the default is now 360 minutes (6 hours) -- a real farmer does not want
+# a repeat "soil still dry" text every 5 minutes; 4 updates a day (roughly
+# dawn / mid-morning / afternoon / evening) is the cadence actually asked for
+# in real deployments and keeps SMS cost and phone-buzzing sane. For a stage
+# demo where you want to see repeats quickly, override it in .env:
+#   ALERT_COOLDOWN_MINUTES=5
+ALERT_COOLDOWN_MINUTES = int(os.getenv("ALERT_COOLDOWN_MINUTES", "360"))
 
 # Fertilizer and harvest reminders depend only on the calendar and stay true for
 # days (HARVEST_CHECK_DUE for good), so they repeat far less often than the above --

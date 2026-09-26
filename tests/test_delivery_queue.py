@@ -38,7 +38,7 @@ def env(monkeypatch):
     monkeypatch.setattr(delivery_queue, "get_weather", lambda: {"available": True, "rain_expected": False, "forecast": []})
     monkeypatch.setattr(delivery_queue, "get_mandi_price", lambda: {"available": False})
     sms = []
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: (sms.append(m), {"success": True, "status_code": 201})[1])
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: (sms.append(m), {"success": True, "status_code": 201})[1])
     yield sms
 
 
@@ -64,7 +64,7 @@ def test_backoff_follows_the_configured_fixed_sequence(monkeypatch, env):
     an attempt is made (not from the simulated `now` used only to decide
     whether a job is currently due) -- a real backoff timer must be real time.
     """
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "down", "retryable": True})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "down", "retryable": True})
     post(1)
 
     before = datetime.now()
@@ -85,7 +85,7 @@ def test_backoff_follows_the_configured_fixed_sequence(monkeypatch, env):
 def test_backoff_caps_at_the_last_configured_value(monkeypatch, env):
     monkeypatch.setattr(delivery_queue, "SMS_RETRY_BACKOFF_SECONDS", [10, 20])
     monkeypatch.setattr(delivery_queue, "SMS_RETRY_MAX_ATTEMPTS", 5)
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "down", "retryable": True})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "down", "retryable": True})
     post(1)
     due_at = datetime.now()
     before = due_at
@@ -97,6 +97,35 @@ def test_backoff_caps_at_the_last_configured_value(monkeypatch, env):
     assert job.attempts == 4
     # attempt 4 (the 3rd retry) uses the LAST configured backoff (20s), not something larger
     assert 15 <= (job.next_attempt_at - before).total_seconds() <= 25
+
+
+# ------------------------------------------------------------- multi-recipient fan-out
+
+def test_every_recipient_gets_its_own_job_and_its_own_send(monkeypatch):
+    """v5: one job per ADVISORY_RECIPIENTS entry, and each send goes to that job's number."""
+    numbers = ["+919876543210", "+919812345678"]
+    monkeypatch.setattr(delivery_queue, "ADVISORY_RECIPIENTS", numbers)
+    sent_to = []
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, to=None: (sent_to.append(to), {"success": True, "status_code": 201})[1])
+    post(1)
+    delivery_queue.process_all_pending()
+    with database.session_scope() as db:
+        assert sorted(j.recipient for j in db.query(DeliveryJob).all()) == sorted(numbers)
+    assert sorted(sent_to) == sorted(numbers)
+
+
+def test_one_failing_recipient_does_not_block_the_others(monkeypatch):
+    monkeypatch.setattr(delivery_queue, "ADVISORY_RECIPIENTS", ["+919876543210", "+919812345678"])
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, to=None: (
+        {"success": False, "error": "down", "retryable": True} if to == "+919876543210"
+        else {"success": True, "status_code": 201}
+    ))
+    post(1)
+    delivery_queue.process_all_pending()
+    with database.session_scope() as db:
+        status = {j.recipient: j.status for j in db.query(DeliveryJob).all()}
+    assert status["+919876543210"] == "retrying"
+    assert status["+919812345678"] == "sent"
 
 
 def _the_only_job() -> DeliveryJob:

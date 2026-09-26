@@ -46,11 +46,11 @@ def isolated(monkeypatch):
 
     calls = {"sms": [], "voice": []}
 
-    def fake_sms(message):
+    def fake_sms(message, **_):
         calls["sms"].append(message)
         return {"success": True, "status_code": 201}
 
-    def fake_voice(message):
+    def fake_voice(message, **_):
         calls["voice"].append(message)
         return {"success": True, "status_code": 201}
 
@@ -262,7 +262,7 @@ def test_moisture_hysteresis_through_the_api(isolated):
 
 
 def test_sms_failure_is_reported_not_swallowed(monkeypatch):
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "Twilio 21608: unverified", "retryable": False})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "Twilio 21608: unverified", "retryable": False})
     client.post("/sensor-data", json=reading(1, 20), headers=KEY)
     delivery_queue.process_all_pending()
     snap = state_manager.get_snapshot("FIELD-001")
@@ -281,7 +281,7 @@ def test_voice_enabled_sends_call_and_sms(monkeypatch, isolated):
 
 def test_voice_failure_does_not_block_sms(monkeypatch, isolated):
     monkeypatch.setattr(delivery_queue, "ENABLE_VOICE_CALL", True)
-    monkeypatch.setattr(delivery_queue, "make_voice_call", lambda m: {"success": False, "status_code": 500, "retryable": False})
+    monkeypatch.setattr(delivery_queue, "make_voice_call", lambda m, **_: {"success": False, "status_code": 500, "retryable": False})
     client.post("/sensor-data", json=reading(1, 20), headers=KEY)
     delivery_queue.process_all_pending()
     snap = state_manager.get_snapshot("FIELD-001")
@@ -529,7 +529,7 @@ def test_sms_event_recorded_on_success(isolated):
 
 
 def test_sms_event_recorded_on_failure(monkeypatch, isolated):
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "textbee 401: bad key", "retryable": False})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "textbee 401: bad key", "retryable": False})
     client.post("/demo/scenario/sensor_fault_dht", headers=KEY)
     event = state_manager.get_last_sms_event()
     assert event["ok"] is False and event["error"] == "textbee 401: bad key"

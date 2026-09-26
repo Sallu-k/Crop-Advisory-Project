@@ -25,6 +25,11 @@ for suffix in ("", "-wal", "-shm"):
 
 os.environ["DATABASE_URL"] = f"sqlite:///{_DB_PATH}"
 os.environ["ENABLE_DELIVERY_WORKER"] = "false"
+# v5 creates no delivery jobs when no recipient is configured, so pin exactly one
+# fake recipient -- the suite must not depend on (or fan out to) whatever numbers
+# a developer's real .env happens to hold. load_dotenv() never overrides these.
+os.environ["ADVISORY_TO_NUMBER"] = "+910000000000"
+os.environ["ADVISORY_TO_NUMBERS"] = ""
 
 import pytest
 

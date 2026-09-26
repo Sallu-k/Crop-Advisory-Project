@@ -52,7 +52,7 @@ def env(monkeypatch):
     monkeypatch.setattr(main, "get_mandi_price", lambda: {"available": False})
     monkeypatch.setattr(delivery_queue, "get_mandi_price", lambda: {"available": False})
     sms = []
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: (sms.append(m), {"success": True, "status_code": 201})[1])
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: (sms.append(m), {"success": True, "status_code": 201})[1])
     yield sms
 
 
@@ -99,7 +99,7 @@ def test_failed_sms_does_not_roll_back_the_alert_but_the_job_keeps_retrying(monk
     The alert is considered "notified" as soon as it's queued; the persistent
     DeliveryJob itself is what retries, with backoff, independently.
     """
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "network down", "retryable": True})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "network down", "retryable": True})
     first = post(1).json()
     assert first["alerts_created"] == ["LOW_MOISTURE"]
     delivery_queue.process_all_pending()
@@ -109,7 +109,7 @@ def test_failed_sms_does_not_roll_back_the_alert_but_the_job_keeps_retrying(monk
     assert post(2).json()["alerts_created"] == []
 
     # ...but the job itself is retryable, and completes once given a chance (and a working provider)
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: (env.append(m), {"success": True, "status_code": 201})[1])
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: (env.append(m), {"success": True, "status_code": 201})[1])
     delivery_queue.process_all_pending(now=datetime.now() + timedelta(minutes=10))
     assert len(env) == 1
     assert state_manager.get_snapshot("D1")["delivery"]["sms_status"] == "sent"
@@ -117,7 +117,7 @@ def test_failed_sms_does_not_roll_back_the_alert_but_the_job_keeps_retrying(monk
 
 def test_permanent_failure_stops_retrying_after_the_attempt_cap(monkeypatch, env):
     monkeypatch.setattr(delivery_queue, "SMS_RETRY_MAX_ATTEMPTS", 2)
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "still down", "retryable": True})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "still down", "retryable": True})
     post(1)
     for _ in range(3):
         delivery_queue.process_all_pending(now=datetime.now() + timedelta(hours=1))
@@ -128,7 +128,7 @@ def test_permanent_failure_stops_retrying_after_the_attempt_cap(monkeypatch, env
 
 def test_an_invalid_number_is_never_retried(monkeypatch, env):
     """A permanent (non-retryable) failure gives up after the FIRST attempt, not the whole cap."""
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "Twilio 21608: unverified", "retryable": False})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "Twilio 21608: unverified", "retryable": False})
     post(1)
     delivery_queue.process_all_pending()
     delivery_queue.process_all_pending(now=datetime.now() + timedelta(hours=1))
@@ -138,8 +138,8 @@ def test_an_invalid_number_is_never_retried(monkeypatch, env):
 def test_voice_and_sms_delivery_are_fully_independent(monkeypatch, env):
     monkeypatch.setattr(delivery_queue, "ENABLE_VOICE_CALL", True)
     monkeypatch.setattr(delivery_queue, "build_voice_message", lambda codes: "v")
-    monkeypatch.setattr(delivery_queue, "make_voice_call", lambda m: {"success": True, "status_code": 201})
-    monkeypatch.setattr(delivery_queue, "send_sms", lambda m: {"success": False, "error": "x", "retryable": False})
+    monkeypatch.setattr(delivery_queue, "make_voice_call", lambda m, **_: {"success": True, "status_code": 201})
+    monkeypatch.setattr(delivery_queue, "send_sms", lambda m, **_: {"success": False, "error": "x", "retryable": False})
     post(1)
     delivery_queue.process_all_pending()
     snap = state_manager.get_snapshot("D1")

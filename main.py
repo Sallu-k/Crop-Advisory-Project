@@ -1,5 +1,9 @@
 """
-Main FastAPI app -- v3.
+Main FastAPI app -- v5.
+
+v5 adds multi-recipient delivery (ADVISORY_TO_NUMBERS, see config.py and
+services/delivery_queue.py) and a production-realistic default alert cadence
+(ALERT_COOLDOWN_MINUTES=360, i.e. every 6 hours instead of every 5 minutes).
 
 Architectural change from v2: /sensor-data no longer waits for weather /
 mandi / SMS / voice before answering the ESP32. It authenticates, validates,
@@ -48,7 +52,7 @@ import services.delivery_queue as delivery_queue
 import services.worker as worker
 
 from config import (
-    ADVISORY_TO_NUMBER, EXPECTED_DEVICE_KEY, SOWING_DATE, ENABLE_VOICE_CALL, TRANSLATE_SMS_TO, PUBLIC_MODE,
+    ADVISORY_RECIPIENTS, EXPECTED_DEVICE_KEY, SOWING_DATE, ENABLE_VOICE_CALL, TRANSLATE_SMS_TO, PUBLIC_MODE,
     ENABLE_DELIVERY_WORKER,
 )
 
@@ -83,7 +87,7 @@ if PUBLIC_MODE and public_mode_problem(EXPECTED_DEVICE_KEY):
 
 # On a public server the interactive API docs are switched off (they advertise every endpoint).
 app = FastAPI(
-    title="Crop Advisory Backend v3",
+    title="Crop Advisory Backend v5",
     **({"docs_url": None, "redoc_url": None, "openapi_url": None} if PUBLIC_MODE else {}),
 )
 
@@ -97,10 +101,16 @@ if not EXPECTED_DEVICE_KEY:
     )
 
 
-if not re.fullmatch(r"\+\d{8,15}", ADVISORY_TO_NUMBER or ""):
+_bad_recipients = [n for n in ADVISORY_RECIPIENTS if not re.fullmatch(r"\+\d{8,15}", n)]
+if not ADVISORY_RECIPIENTS:
     logging.warning(
-        "ADVISORY_TO_NUMBER is missing or not in international format (e.g. +919876543210): "
-        "SMS alerts will not reach anyone. Set it in .env."
+        "ADVISORY_TO_NUMBER / ADVISORY_TO_NUMBERS is empty: SMS alerts will not reach anyone. "
+        "Set it in .env."
+    )
+elif _bad_recipients:
+    logging.warning(
+        "These entries in ADVISORY_TO_NUMBERS are not in international format (e.g. "
+        "+919876543210) and will be skipped at send time: %s", ", ".join(_bad_recipients),
     )
 
 

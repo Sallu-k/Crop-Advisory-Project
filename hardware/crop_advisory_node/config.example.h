@@ -2,11 +2,11 @@
 #define CONFIG_H
 
 // ---- Wi-Fi credentials ----
-#define WIFI_SSID       "Cookie"
-#define WIFI_PASSWORD   "99867442"
+#define WIFI_SSID "YOUR_WIFI_NAME"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 
 // ---- Backend endpoint ----
-#define BACKEND_URL     "http://10.144.56.125:8000/sensor-data"
+#define BACKEND_URL "YOUR_BACKEND_URL"
 
 // ---- Device identity ----
 #define DEVICE_ID       "FIELD-001"

@@ -44,19 +44,26 @@ def _status_is_retryable(status_code) -> bool:
     return status_code == 429 or (isinstance(status_code, int) and 500 <= status_code < 600)
 
 
-def send_sms(message: str) -> dict:
-    """Routes to the configured SMS provider. Never raises -- failures come back as a dict."""
+def send_sms(message: str, to: str = None) -> dict:
+    """Routes to the configured SMS provider. Never raises -- failures come back as a dict.
+
+    `to` defaults to ADVISORY_TO_NUMBER for backward compatibility, but v5's
+    multi-recipient fan-out (see services/delivery_queue.py) passes each
+    job's own recipient explicitly, so a household with several registered
+    numbers actually reaches all of them instead of only the first.
+    """
+    recipient = to or ADVISORY_TO_NUMBER
     if SMS_PROVIDER == "textbee":
-        return _send_sms_textbee(message)
-    return _send_sms_twilio(message)
+        return _send_sms_textbee(message, recipient)
+    return _send_sms_twilio(message, recipient)
 
 
-def _send_sms_twilio(message: str) -> dict:
+def _send_sms_twilio(message: str, to: str = None) -> dict:
     try:
         url = f"{TWILIO_BASE_URL}/Messages.json"
         payload = {
             "From": TWILIO_FROM_NUMBER,
-            "To": ADVISORY_TO_NUMBER,
+            "To": to or ADVISORY_TO_NUMBER,
             "Body": message,
         }
         response = requests.post(
@@ -84,19 +91,19 @@ def _send_sms_twilio(message: str) -> dict:
         return {"success": False, "error": str(e), "retryable": False}
 
 
-def _send_sms_textbee(message: str) -> dict:
+def _send_sms_textbee(message: str, to: str = None) -> dict:
     """
     Sends SMS via textbee (https://textbee.dev) -- turns your own Android
     phone into the SMS sender, using its existing SIM/carrier plan. No
     trial-template restriction, no per-message cost, no DLT registration
-    needed for this kind of low-volume personal/prototype use.
+    needed for this kind of low-volume personal use.
 
     Setup: install the textbee app on an Android phone, register it at
     textbee.dev to get an API key, put that in TEXTBEE_API_KEY.
     """
     try:
         headers = {"x-api-key": TEXTBEE_API_KEY}
-        payload = {"recipients": [ADVISORY_TO_NUMBER], "message": message}
+        payload = {"recipients": [to or ADVISORY_TO_NUMBER], "message": message}
         if TEXTBEE_DEVICE_ID:
             payload["deviceId"] = TEXTBEE_DEVICE_ID
         response = requests.post(
@@ -120,12 +127,15 @@ def _send_sms_textbee(message: str) -> dict:
         return {"success": False, "error": str(e), "retryable": False}
 
 
-def make_voice_call(message: str) -> dict:
+def make_voice_call(message: str, to: str = None) -> dict:
     """
     Places an automated voice call reading `message` aloud via Twilio's
     <Say> TwiML verb. Voice is Twilio-only (textbee is SMS-only). Voice +
-    language are configurable (see config.py).
+    language are configurable (see config.py). `to` defaults to
+    ADVISORY_TO_NUMBER; see send_sms() above for why v5 usually passes it
+    explicitly instead.
     """
+    recipient = to or ADVISORY_TO_NUMBER
     try:
         safe_message = (
             message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -138,7 +148,7 @@ def make_voice_call(message: str) -> dict:
         url = f"{TWILIO_BASE_URL}/Calls.json"
         payload = {
             "From": TWILIO_FROM_NUMBER,
-            "To": ADVISORY_TO_NUMBER,
+            "To": recipient,
             "Twiml": twiml,
         }
         response = requests.post(

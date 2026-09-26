@@ -16,7 +16,7 @@ import logging
 from datetime import datetime
 
 from config import (
-    ADVISORY_TO_NUMBER, ENABLE_VOICE_CALL, SMS_RETRY_BACKOFF_SECONDS, SMS_RETRY_MAX_ATTEMPTS,
+    ADVISORY_RECIPIENTS, ENABLE_VOICE_CALL, SMS_RETRY_BACKOFF_SECONDS, SMS_RETRY_MAX_ATTEMPTS,
 )
 from database import session_scope
 from mandi import get_mandi_price
@@ -38,28 +38,32 @@ def create_delivery_jobs_for_reading(
     language: str = "en", test_mode: bool = False, problem_title: str = None,
 ) -> list:
     """
-    One SMS job (and one voice job too, if ENABLE_VOICE_CALL) per reading that
-    produced new alerts. Also seeds the device's delivery snapshot so the
-    dashboard shows "pending"/"disabled (SMS-only mode)" immediately, instead
-    of nothing, before the worker has had a chance to run.
+    One SMS job (and one voice job too, if ENABLE_VOICE_CALL) per RECIPIENT,
+    per reading that produced new alerts -- v5 fans this out across every
+    number in ADVISORY_RECIPIENTS (a household often has more than one phone
+    that should hear about the field), each with its own independent
+    retry/backoff so one bad number never blocks or delays the others. Also
+    seeds the device's delivery snapshot so the dashboard shows
+    "pending"/"disabled (SMS-only mode)" immediately, instead of nothing,
+    before the worker has had a chance to run.
     """
-    if not alert_events:
+    if not alert_events or not ADVISORY_RECIPIENTS:
         return []
 
     alert_event_ids = [e.id for e in alert_events]
-    jobs = [
-        delivery_repo.create_job(
-            db, device_id=device.device_id, reading_id=reading.id, alert_event_ids=alert_event_ids,
-            new_alert_codes=new_codes, channel="sms", recipient=ADVISORY_TO_NUMBER, language=language,
-            test_mode=test_mode, problem_title=problem_title,
-        )
-    ]
-    if ENABLE_VOICE_CALL:
+    jobs = []
+    for recipient in ADVISORY_RECIPIENTS:
         jobs.append(delivery_repo.create_job(
             db, device_id=device.device_id, reading_id=reading.id, alert_event_ids=alert_event_ids,
-            new_alert_codes=new_codes, channel="voice", recipient=ADVISORY_TO_NUMBER, language=language,
+            new_alert_codes=new_codes, channel="sms", recipient=recipient, language=language,
             test_mode=test_mode, problem_title=problem_title,
         ))
+        if ENABLE_VOICE_CALL:
+            jobs.append(delivery_repo.create_job(
+                db, device_id=device.device_id, reading_id=reading.id, alert_event_ids=alert_event_ids,
+                new_alert_codes=new_codes, channel="voice", recipient=recipient, language=language,
+                test_mode=test_mode, problem_title=problem_title,
+            ))
 
     devices_repo.save_delivery_snapshot(db, device, {
         "_reading_id": reading.id,
@@ -148,10 +152,10 @@ def _process_claimed_job(db, job_id: int) -> dict:
 
     if job.channel == "voice":
         message = build_voice_message(new_codes)
-        send_result = make_voice_call(message)
+        send_result = make_voice_call(message, to=job.recipient)
     else:
         message = prefix + build_sms_message(alert_codes, facts, lang=job.language, reading_time=reading.received_at)
-        send_result = send_sms(message)
+        send_result = send_sms(message, to=job.recipient)
 
     # From here on, a real side effect may already have happened (the SMS/call
     # provider was called) -- that can't be rolled back. Record the outcome and
